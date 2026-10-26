@@ -455,7 +455,10 @@ app.get('/api/public/:token', asyncRoute(async (req, res) => {
     res.json(doc);
 }));
 
-const staticPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../client/dist');
+const staticPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../frontend/dist"
+);
 if (process.env.NODE_ENV === 'production') {
     app.use(express.static(staticPath));
     app.use((req, res, next) => {
