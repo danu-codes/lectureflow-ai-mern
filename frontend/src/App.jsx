@@ -68,6 +68,9 @@ function LectureDashboard({ user, onLogout }) {
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [gapWarning, setGapWarning] = useState('');
+  const [noteNotice, setNoteNotice] = useState('');
+  const [transcriptionMode, setTranscriptionMode] = useState('browser');
+  const [transcriptionLanguage, setTranscriptionLanguage] = useState('en-US');
   const recorderRef = useRef(null);
   const currentIdRef = useRef(null);
   currentIdRef.current = activeId;
@@ -224,6 +227,8 @@ function LectureDashboard({ user, onLogout }) {
         setLecture(doc);
         setDraft(doc.notesMarkdown);
       }
+      if (doc.notesWarning) setNoteNotice(doc.notesWarning);
+      else setNoteNotice('');
       await loadList(query);
       return doc;
     } catch (e) {
@@ -237,7 +242,7 @@ function LectureDashboard({ user, onLogout }) {
 
   async function startRecording() {
     if (!lecture || recordingRef.current !== 'idle' || busy) return;
-    setError(''); setInterim(''); setGapWarning(''); setTab('transcript');
+    setError(''); setInterim(''); setGapWarning(''); setNoteNotice(''); setTab('transcript');
     const rec = new LectureRecorder(lecture._id, {
       interim: setInterim,
       status: setLiveStatus,
@@ -252,7 +257,7 @@ function LectureDashboard({ user, onLogout }) {
           await flushPending();
         } catch (e) { alertError(e); }
       }
-    });
+    }, { mode: transcriptionMode, language: transcriptionLanguage });
     recorderRef.current = rec;
     recordingRef.current = 'starting';
     setRecordState('starting');
@@ -363,7 +368,7 @@ function LectureDashboard({ user, onLogout }) {
         {listOther.length ? listOther.map(sidebarItem) : <p className="empty-side">No lectures found.</p>}
       </div>
       <div className="sidebar-footer">
-        <div className="account-card"><span className="account-avatar"><UserRound size={17} /></span><span className="account-details"><strong>{user.name}</strong><small title={user.email}>{user.email}</small></span><IconButton title="Sign out" disabled={recordState !== 'idle' || busy} onClick={onLogout}><LogOut size={18} /></IconButton></div>
+        <div className="account-card"><span className="account-avatar"><UserRound size={17}/></span><span className="account-details"><strong>{user.name}</strong><small title={user.email}>{user.email}</small></span><IconButton title="Sign out" disabled={recordState !== 'idle' || busy} onClick={onLogout}><LogOut size={18}/></IconButton></div>
         <span className="privacy-hint">Your audio stays on this device.</span>
       </div>
     </aside>
@@ -395,6 +400,24 @@ function LectureDashboard({ user, onLogout }) {
           </div></div>
 
         <section className={`record-card ${running ? 'is-recording' : ''}`}>
+          <div className="transcription-settings">
+            <label>Speech recognition
+              <select value={transcriptionMode} disabled={running || busy} onChange={event => setTranscriptionMode(event.target.value)}>
+                <option value="browser">Browser captions (no Gemini for speech)</option>
+                <option value="gemini">Gemini Live captions (experimental)</option>
+              </select>
+            </label>
+            {transcriptionMode === 'browser' && <label>Spoken language
+              <select value={transcriptionLanguage} disabled={running || busy} onChange={event => setTranscriptionLanguage(event.target.value)}>
+                <option value="en-US">English</option>
+                <option value="ta-IN">Tamil</option>
+                <option value="si-LK">Sinhala</option>
+              </select>
+            </label>}
+            <p className="speech-privacy-note">{transcriptionMode === 'browser'
+              ? 'Browser captions do not use your Gemini key. Chrome/Edge may send speech to their recognition provider and may require internet. Accuracy and language support vary.'
+              : 'Gemini Live uses temporary tokens. If it fails, LectureFlow tries browser captions without stopping audio recording.'}</p>
+          </div>
           <div className="record-info"><div className="record-indicator"><span className={running && recordState === 'recording' ? 'red-dot' : 'muted-dot'} /> {running ? (recordState === 'starting' ? 'Starting...' : recordState === 'paused' ? 'Paused' : recordState === 'stopping' ? 'Finishing...' : 'Recording') : 'Ready to record'}</div><strong className="timer">{fmt(seconds)}</strong></div>
           <div className="waveform" aria-hidden="true">{Array.from({ length: 64 }, (_, i) => <span key={i} style={{ '--h': `${7 + Math.abs(Math.sin(i * 1.4) * Math.cos(i * 0.41)) * 33}px`, '--d': `${(i % 11) * 0.08}s` }} className={recordState === 'recording' ? 'moving' : ''} />)}</div>
           <div className="record-controls">{recordState === 'idle' ? <button onClick={startRecording} disabled={busy} className="record-start"><Mic size={20} /> Start recording</button> : <>
@@ -413,8 +436,8 @@ function LectureDashboard({ user, onLogout }) {
           <button className={tab === 'notes' ? 'selected' : ''} onClick={() => setTab('notes')}><BookOpenText size={17} /> Organized notes</button>
         </div>
           {tab === 'notes' ? <div className="tab-actions">
-            {(!lecture.notesMarkdown || lecture.notesStatus === 'failed') && !busy && !running && !!lecture.transcript?.length &&
-              <button className="small-action" onClick={() => organizeNotes(lecture._id)}><Sparkles size={16} /> Retry AI notes</button>}
+            {(!lecture.notesMarkdown || ['failed', 'transcript'].includes(lecture.notesStatus)) && !busy && !running && !!lecture.transcript?.length &&
+              <button className="small-action" onClick={() => organizeNotes(lecture._id)}><Sparkles size={16} /> {lecture.notesStatus === 'transcript' ? 'Generate AI summary' : 'Retry AI notes'}</button>}
             {busy && <span className="transcript-count"><Sparkles size={15} /> Generating notes...</span>}
           </div>
             : <span className="transcript-count">{lecture.transcript?.length || 0} segments</span>}
@@ -427,7 +450,8 @@ function LectureDashboard({ user, onLogout }) {
           </div>)}
           {!!interim && <div className="segment interim"><span className="timestamp">LIVE</span><p>{interim}<span className="typing-cursor" /></p></div>}
         </div> : <div className="note-content">
-          <div className="note-toolbar"><span>AI notes can be edited before sharing or exporting.</span>
+          {noteNotice && <div className="note-notice" role="status"><CircleHelp size={17}/><span>{noteNotice}</span><button type="button" onClick={() => setNoteNotice('')} aria-label="Dismiss notes status"><X size={16}/></button></div>}
+          <div className="note-toolbar"><span>{lecture.notesStatus === 'transcript' ? 'Captured transcript notes — not AI-generated. You can edit or export them.' : 'AI notes can be edited before sharing or exporting.'}</span>
             <button className="small-action" disabled={busy} onClick={() => { if (editing) setEditing(false); else { setDraft(lecture.notesMarkdown || ''); setEditing(true); } }}><Pencil size={15} />{editing ? 'Cancel editing' : 'Edit notes'}</button></div>
           {editing ? <><textarea className="notes-editor" rows={16} value={draft} onChange={e => setDraft(e.target.value)} placeholder="# Lecture topic\n\nWrite your notes here..." />
             <button className="primary-button" onClick={() => patch({ notesMarkdown: draft }).then(() => setEditing(false)).catch(alertError)}><Check size={17} /> Save notes</button></> :
@@ -477,7 +501,7 @@ export default function App() {
   }
 
   if (publicPage) return <PublicLecture />;
-  if (checking) return <div className="auth-loading"><AudioLines size={25} /> Checking your session...</div>;
-  if (!user) return <AuthPage onAuth={setUser} />;
-  return <LectureDashboard key={user.id} user={user} onLogout={logout} />;
+  if (checking) return <div className="auth-loading"><AudioLines size={25}/> Checking your session...</div>;
+  if (!user) return <AuthPage onAuth={setUser}/>;
+  return <LectureDashboard key={user.id} user={user} onLogout={logout}/>;
 }

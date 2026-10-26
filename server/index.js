@@ -70,7 +70,7 @@ const lectureSchema = new mongoose.Schema({
     pinned: { type: Boolean, default: false },
     transcript: { type: [transcriptSchema], default: [] },
     notesMarkdown: { type: String, default: '' },
-    notesStatus: { type: String, enum: ['idle', 'processing', 'ready', 'failed'], default: 'idle' },
+    notesStatus: { type: String, enum: ['idle', 'processing', 'ready', 'failed', 'transcript'], default: 'idle' },
     notesStartedAt: { type: Date, default: null },
     durationSeconds: { type: Number, default: 0 },
     shareHash: { type: String, default: null, index: true },
@@ -340,12 +340,56 @@ async function aiNotes(contents) {
     return parsed;
 }
 
+
+// Reliable, non-AI fallback. Preserves every captured sentence in order.
+// This is an annotated transcript, NOT an AI summary or a reconstruction of missing audio.
+function buildTranscriptNotes(doc) {
+    const lines = [
+        '> **Transcript-based notes (not an AI summary).** These are the words captured by',
+        '> speech recognition. Missing or misheard speech cannot be recovered from text.',
+        '',
+        '## Captured lecture transcript',
+        ''
+    ];
+    let lastBlock = -1;
+    for (const segment of doc.transcript) {
+        const seconds = Math.max(0, Math.floor(Number(segment.seconds) || 0));
+        const block = Math.floor(seconds / 300);
+        if (block !== lastBlock) {
+            const mm = block * 5;
+            lines.push(`### ${mm}–${mm + 5} minutes`, '');
+            lastBlock = block;
+        }
+        const stamp = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+        lines.push(`- **[${stamp}]** ${String(segment.text || '').replace(/\s+/g, ' ').trim()}`);
+    }
+    const notes = lines.join('\n');
+    if (notes.length > 120000) {
+        return notes.slice(0, 119800) + '\n\n> Transcript notes are too long for this field. The complete segments remain in the Transcript tab.\n';
+    }
+    return notes;
+}
+
+async function saveTranscriptFallback(doc, warning) {
+    // A transient Gemini error must not erase a previously saved, valid AI summary.
+    if (!doc.notesMarkdown?.trim() || doc.notesStatus === 'transcript') {
+        doc.notesMarkdown = buildTranscriptNotes(doc);
+        doc.notesStatus = 'transcript';
+    } else {
+        // Preserve previously saved AI or manually edited notes on temporary AI failures.
+        doc.notesStatus = 'ready';
+    }
+    doc.notesStartedAt = null;
+    await doc.save();
+    return { ...doc.toObject(), notesWarning: warning };
+}
+
 app.post('/api/lectures/:id/organize', aiLimiter, asyncRoute(async (req, res) => {
-    if (!ai) return sendError(res, 503, 'Set GEMINI_API_KEY in server/.env');
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
     const doc = await Lecture.findOne({ _id: req.params.id, userId: req.userId });
     if (!doc) return sendError(res, 404, 'Lecture not found');
     if (!doc.transcript.length) return sendError(res, 400, 'There is no finalized transcript yet. Audio saved locally has NOT been retranscribed.');
+    if (!ai) return res.json(await saveTranscriptFallback(doc, 'Gemini is not configured. Saved complete captured transcript notes instead.'));
     if (doc.notesStatus === 'processing' && doc.notesStartedAt && (Date.now() - doc.notesStartedAt.getTime()) < 5 * 60_000) {
         return sendError(res, 409, 'Notes generation is already running');
     }
@@ -379,11 +423,11 @@ substantive ideas, definitions, and examples. Ignore unrelated conversations.\n\
         await doc.save();
         res.json(doc);
     } catch (error) {
-        await Lecture.updateOne(
-            { _id: doc._id, userId: req.userId },
-            { $set: { notesStatus: 'failed', notesStartedAt: null } }
-        ).catch(() => { });
-        return aiFailure(res, error, 'notes-generation');
+        // Preserve all captured content when Gemini errors, times out, or hits quota.
+        console.error('Gemini notes generation failed:', safeErrorMessage(error));
+        const saved = await saveTranscriptFallback(doc,
+            'AI notes could not be generated. Captured transcript notes were saved instead. You can retry AI notes later.');
+        return res.json(saved);
     }
 }));
 
