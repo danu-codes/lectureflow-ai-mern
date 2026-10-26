@@ -1315,25 +1315,6 @@ h3 {
   min-width: 0;
 }
 
-.speaker-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  color: var(--muted);
-  margin-top: 10px;
-}
-
-.speaker-label select {
-  font-size: 11px;
-  padding: 5px 7px;
-  border-radius: 7px;
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--stroke);
-  max-width: 175px;
-}
-
 @media (max-width:700px) {
   .rename-dialog {
     padding: 20px;
@@ -1342,4 +1323,34 @@ h3 {
   .live-caption p {
     font-size: 13px;
   }
+}
+
+/* v3: automatically generated notes after Stop */
+.notes-progress {
+  padding: 26px 20px;
+  border: 1px solid var(--stroke);
+  background: var(--surface-2);
+  border-radius: 14px;
+}
+
+.notes-progress svg {
+  color: var(--accent);
+}
+
+.notes-progress h3 {
+  font-size: 16px;
+  margin: 12px 0 6px;
+}
+
+.notes-progress p {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.tab-actions .transcript-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }

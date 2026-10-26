@@ -67,6 +67,7 @@ export default function App() {
   const [gapWarning, setGapWarning] = useState('');
   const recorderRef = useRef(null);
   const currentIdRef = useRef(null);
+  currentIdRef.current = activeId;
   const secondsRef = useRef(0);
   const flushPromiseRef = useRef(null);
   const recordingRef = useRef('idle');
@@ -141,12 +142,12 @@ export default function App() {
   }, [publicView, flushPending]);
 
   function selectLecture(id) {
-    if (recordingRef.current !== 'idle') return;
+    if (recordingRef.current !== 'idle' || busy) return;
     setActiveId(id); setMobileNav(false); setInterim(''); setError(''); setEditing(false);
     setLecture(null); setTab('transcript');
   }
   async function createLecture() {
-    if (recordingRef.current !== 'idle') return;
+    if (recordingRef.current !== 'idle' || busy) return;
     try {
       const doc = await api('/lectures', { method: 'POST' });
       setList(prev => [doc, ...prev]);
@@ -171,17 +172,6 @@ export default function App() {
       if (id === activeId) setLecture(updated);
       await loadList(query);
     } catch (e) { alertError(e); throw e; }
-  }
-  async function markSpeaker(segmentId, speaker) {
-    if (!lecture) return;
-    try {
-      await api(`/lectures/${lecture._id}/segments/${encodeURIComponent(segmentId)}`, {
-        method: 'PATCH', body: { speaker }
-      });
-      setLecture(prev => prev && ({
-        ...prev, transcript: prev.transcript.map(s => s.id === segmentId ? { ...s, speaker } : s)
-      }));
-    } catch (e) { alertError(e); }
   }
   async function togglePin(id, pinned) {
     try {
@@ -213,22 +203,36 @@ export default function App() {
       await loadList(query);
     } catch (e) { if (e.name !== 'AbortError') alertError(e); }
   }
-  async function organizeNotes() {
-    if (!lecture || recordState !== 'idle') return;
-    setBusy(true); setError('');
+  // Called automatically after Stop. Can also retry when the AI request failed.
+  async function organizeNotes(lectureId = lecture?._id) {
+    if (!lectureId || recordingRef.current !== 'idle') return;
+    setBusy(true);
+    setTab('notes');
+    setError('');
     try {
       await flushPending();
-      const unsaved = await db.pendingSegments.where('lectureId').equals(lecture._id).count();
-      if (unsaved) throw new Error('Some transcript text has not reached MongoDB. Connect to the internet and retry.');
-      const doc = await api(`/lectures/${lecture._id}/organize`, { method: 'POST' });
-      setLecture(doc); setDraft(doc.notesMarkdown); setTab('notes');
+      const unsaved = await db.pendingSegments.where('lectureId').equals(lectureId).count();
+      if (unsaved) {
+        throw new Error('Notes not generated yet: some transcript sentences are waiting to sync. Reconnect and press Retry notes.');
+      }
+      const doc = await api(`/lectures/${lectureId}/organize`, { method: 'POST' });
+      if (currentIdRef.current === lectureId) {
+        setLecture(doc);
+        setDraft(doc.notesMarkdown);
+      }
       await loadList(query);
-    } catch (e) { alertError(e); }
-    finally { setBusy(false); }
+      return doc;
+    } catch (e) {
+      alertError(e);
+      setLecture(previous => previous?._id === lectureId ? { ...previous, notesStatus: 'failed' } : previous);
+      return null;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function startRecording() {
-    if (!lecture || recordingRef.current !== 'idle') return;
+    if (!lecture || recordingRef.current !== 'idle' || busy) return;
     setError(''); setInterim(''); setGapWarning(''); setTab('transcript');
     const rec = new LectureRecorder(lecture._id, {
       interim: setInterim,
@@ -271,28 +275,46 @@ export default function App() {
     }
   }
   async function stopRecording() {
-    if (!recorderRef.current) return;
-    recordingRef.current = 'stopping'; setRecordState('stopping');
+    if (!recorderRef.current || !lecture) return;
+    const lectureId = lecture._id;
+    recordingRef.current = 'stopping';
+    setRecordState('stopping');
+    let shouldGenerate = false;
     try {
+      // Recorder.stop awaits all finalized transcription and local audio writes.
       await recorderRef.current.stop();
       await flushPending();
-      const doc = await api(`/lectures/${lecture._id}`, {
+      const unsaved = await db.pendingSegments.where('lectureId').equals(lectureId).count();
+      const doc = await api(`/lectures/${lectureId}`, {
         method: 'PATCH',
         body: { durationSeconds: secondsRef.current }
       });
-      // Merge any locally displayed segments in case a final upload is still pending.
       setLecture(prev => prev?._id === doc._id ? {
         ...doc,
         transcript: [...doc.transcript, ...(prev.transcript || []).filter(s => !doc.transcript.some(r => r.id === s.id))]
       } : prev);
       await loadList(query);
-      setAudioCount(await db.audioChunks.where('lectureId').equals(lecture._id).count());
+      setAudioCount(await db.audioChunks.where('lectureId').equals(lectureId).count());
+      if (unsaved) {
+        setLecture(prev => prev?._id === lectureId ? { ...prev, notesStatus: 'failed' } : prev);
+        setError('Recording stopped and audio saved locally. Some transcript sentences are waiting to sync; retry notes after reconnection.');
+      } else if (!doc.transcript.length) {
+        setError('No finalized speech was captured. Audio remains locally saved. Notes cannot be generated from an empty transcript.');
+      } else {
+        shouldGenerate = true;
+      }
     } catch (e) { alertError(e); }
     finally {
       recorderRef.current = null;
-      recordingRef.current = 'idle'; setRecordState('idle'); setInterim('');
+      recordingRef.current = 'idle';
+      setRecordState('idle');
+      setInterim('');
+      setTab('notes');
     }
+    // Automatically generate notes after recording and transcript uploads finish.
+    if (shouldGenerate) await organizeNotes(lectureId);
   }
+
   async function makePdf(id = lecture?._id) {
     if (!id) return;
     try {
@@ -308,7 +330,7 @@ export default function App() {
   const listPinned = list.filter(x => x.pinned);
   const listOther = list.filter(x => !x.pinned);
   const sidebarItem = item => <div key={item._id} className={`chat-row ${activeId === item._id ? 'active' : ''}`}>
-    <button className="chat-name" onClick={() => selectLecture(item._id)} disabled={running} title={item.title}>
+    <button className="chat-name" onClick={() => selectLecture(item._id)} disabled={running || busy} title={item.title}>
       <FileText size={16} /> <span>{item.title}</span>
     </button>
     <details className="chat-options">
@@ -329,7 +351,7 @@ export default function App() {
       <div className="brand"><span className="brand-icon"><AudioLines size={21} /></span><span>LectureFlow <b>AI</b></span>
         <IconButton className="mobile-close" title="Close menu" onClick={() => setMobileNav(false)}><X size={19} /></IconButton>
       </div>
-      <button className="new-button" onClick={createLecture} disabled={running}><Plus size={19} /> New lecture</button>
+      <button className="new-button" onClick={createLecture} disabled={running || busy}><Plus size={19} /> New lecture</button>
       <div className="search-box"><Search size={17} /><input aria-label="Search lectures" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search your lectures..." /></div>
       <div className="chat-list">
         {!!listPinned.length && <><div className="group-label"><Pin size={12} /> PINNED</div>{listPinned.map(sidebarItem)}</>}
@@ -353,7 +375,7 @@ export default function App() {
       {!activeId ? <section className="welcome">
         <div className="welcome-icon"><Mic size={28} /></div>
         <h1>Never miss a lecture note.</h1><p>Record lectures, follow the live transcript, and turn speech into organized notes with Gemini AI.</p>
-        <button className="primary-button" onClick={createLecture}><Plus size={19} /> Start a new lecture</button>
+        <button className="primary-button" disabled={busy} onClick={createLecture}><Plus size={19} /> Start a new lecture</button>
         <div className="welcome-features"><span><Check size={16} /> Live transcript</span><span><Check size={16} /> Auto-saved notes</span><span><Check size={16} /> Local audio</span></div>
       </section> : !hasLecture ? <div className="loading-state">Loading lecture...</div> : <section className="workspace">
         <div className="lecture-heading"><div><p className="eyebrow">LECTURE SESSION · {shownDate(lecture.createdAt)}</p><h1>{lecture.title}</h1>
@@ -368,7 +390,7 @@ export default function App() {
         <section className={`record-card ${running ? 'is-recording' : ''}`}>
           <div className="record-info"><div className="record-indicator"><span className={running && recordState === 'recording' ? 'red-dot' : 'muted-dot'} /> {running ? (recordState === 'starting' ? 'Starting...' : recordState === 'paused' ? 'Paused' : recordState === 'stopping' ? 'Finishing...' : 'Recording') : 'Ready to record'}</div><strong className="timer">{fmt(seconds)}</strong></div>
           <div className="waveform" aria-hidden="true">{Array.from({ length: 64 }, (_, i) => <span key={i} style={{ '--h': `${7 + Math.abs(Math.sin(i * 1.4) * Math.cos(i * 0.41)) * 33}px`, '--d': `${(i % 11) * 0.08}s` }} className={recordState === 'recording' ? 'moving' : ''} />)}</div>
-          <div className="record-controls">{recordState === 'idle' ? <button onClick={startRecording} className="record-start"><Mic size={20} /> Start recording</button> : <>
+          <div className="record-controls">{recordState === 'idle' ? <button onClick={startRecording} disabled={busy} className="record-start"><Mic size={20} /> Start recording</button> : <>
             <button className="secondary-button" disabled={recordState === 'stopping' || recordState === 'starting'} onClick={togglePause}>{recordState === 'paused' ? <Play size={18} /> : <Pause size={18} />} {recordState === 'paused' ? 'Resume' : 'Pause'}</button>
             <button className="stop-button" disabled={recordState === 'stopping' || recordState === 'starting'} onClick={stopRecording}><Square size={16} fill="currentColor" /> Stop</button>
           </>}</div>
@@ -383,32 +405,32 @@ export default function App() {
           <button className={tab === 'transcript' ? 'selected' : ''} onClick={() => setTab('transcript')}><AudioLines size={17} /> Transcript</button>
           <button className={tab === 'notes' ? 'selected' : ''} onClick={() => setTab('notes')}><BookOpenText size={17} /> Organized notes</button>
         </div>
-          {tab === 'notes' ? <div className="tab-actions"><button disabled={!lecture.transcript?.length || busy || running} className="small-action" onClick={organizeNotes}><Sparkles size={16} />{busy ? 'Generating...' : 'Generate AI notes'}</button></div>
+          {tab === 'notes' ? <div className="tab-actions">
+            {(!lecture.notesMarkdown || lecture.notesStatus === 'failed') && !busy && !running && !!lecture.transcript?.length &&
+              <button className="small-action" onClick={() => organizeNotes(lecture._id)}><Sparkles size={16} /> Retry AI notes</button>}
+            {busy && <span className="transcript-count"><Sparkles size={15} /> Generating notes...</span>}
+          </div>
             : <span className="transcript-count">{lecture.transcript?.length || 0} segments</span>}
         </div>
         {tab === 'transcript' ? <div className="transcript-content">
           {!lecture.transcript?.length && !interim && <div className="empty-content"><Mic size={30} /><h3>Waiting for your lecture</h3><p>Press Start recording. Confirmed sentences will appear here and save to MongoDB.</p></div>}
           {lecture.transcript?.map((s, i) => <div className="segment" key={s.id || i}>
             <span className="timestamp">{fmt(s.seconds)}</span>
-            <div className="segment-content"><p>{s.text}</p>
-              <label className="speaker-label">Speaker:
-                <select aria-label={`Speaker for transcript segment ${i + 1}`} value={s.speaker || 'unknown'}
-                  disabled={running} onChange={e => markSpeaker(s.id, e.target.value)}>
-                  <option value="unknown">Unidentified</option>
-                  <option value="lecturer">Lecturer</option>
-                  <option value="student">Student / question</option>
-                  <option value="offtopic">Off-topic · skip in notes</option>
-                </select>
-              </label>
-            </div>
+            <div className="segment-content"><p>{s.text}</p></div>
           </div>)}
           {!!interim && <div className="segment interim"><span className="timestamp">LIVE</span><p>{interim}<span className="typing-cursor" /></p></div>}
         </div> : <div className="note-content">
           <div className="note-toolbar"><span>AI notes can be edited before sharing or exporting.</span>
-            <button className="small-action" onClick={() => { if (editing) setEditing(false); else { setDraft(lecture.notesMarkdown || ''); setEditing(true); } }}><Pencil size={15} />{editing ? 'Cancel editing' : 'Edit notes'}</button></div>
+            <button className="small-action" disabled={busy} onClick={() => { if (editing) setEditing(false); else { setDraft(lecture.notesMarkdown || ''); setEditing(true); } }}><Pencil size={15} />{editing ? 'Cancel editing' : 'Edit notes'}</button></div>
           {editing ? <><textarea className="notes-editor" rows={16} value={draft} onChange={e => setDraft(e.target.value)} placeholder="# Lecture topic\n\nWrite your notes here..." />
             <button className="primary-button" onClick={() => patch({ notesMarkdown: draft }).then(() => setEditing(false)).catch(alertError)}><Check size={17} /> Save notes</button></> :
-            <div className="markdown-body"><ReactMarkdown>{lecture.notesMarkdown || 'No organized notes yet. Record your lecture, then select **Generate AI notes**.'}</ReactMarkdown></div>}
+            <div className="markdown-body">
+              {busy ? <div className="notes-progress" role="status">
+                <Sparkles size={22} />
+                <h3>Creating your lecture notes...</h3>
+                <p>Gemini is reviewing the full transcript, keeping subject explanations and relevant Q&amp;A, and ignoring unrelated conversations.</p>
+              </div> : <ReactMarkdown>{lecture.notesMarkdown || 'Your notes will be generated automatically after you stop recording. The complete raw transcript stays available in the Transcript tab.'}</ReactMarkdown>}
+            </div>}
         </div>}
         <div className="lecture-footer">
           <button className="small-action" onClick={() => downloadLocalAudio(lecture._id, lecture.title).catch(alertError)} disabled={!audioCount || running}><Download size={16} /> Download local audio {audioCount ? `(${audioCount} chunks)` : ''}</button>
