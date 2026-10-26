@@ -13,9 +13,13 @@ dotenv.config({ path: fileURLToPath(new URL('./.env', import.meta.url)) });
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
+// Trust one reverse proxy only when deployed behind it (for example, Render).
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(express.json({ limit: '200kb' }));
-app.use(cookieParser(process.env.ANON_COOKIE_SECRET));
+// Optional previous secret allows re-signing existing anonymous-owner cookies
+// after rotation. Remove ANON_COOKIE_SECRET_PREVIOUS after the migration period.
+const cookieSecrets = [process.env.ANON_COOKIE_SECRET, process.env.ANON_COOKIE_SECRET_PREVIOUS].filter(Boolean);
+app.use(cookieParser(cookieSecrets));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false }));
 
 const transcriptSchema = new mongoose.Schema({
@@ -45,9 +49,16 @@ function asyncRoute(fn) { return (req, res, next) => Promise.resolve(fn(req, res
 function sendError(res, code, message) { return res.status(code).json({ error: message }); }
 
 app.use('/api', (req, res, next) => {
-    let owner = req.signedCookies.lf_owner;
-    if (!owner || !/^[0-9a-f-]{36}$/i.test(owner)) {
-        owner = randomUUID();
+    // Public shared pages do not need to create an anonymous owner cookie.
+    if (req.path === '/health' || req.path.startsWith('/public/')) return next();
+
+    let owner = req.signedCookies?.lf_owner;
+    const isValid = typeof owner === 'string' && /^[0-9a-f-]{36}$/i.test(owner);
+    if (!isValid) owner = randomUUID();
+
+    // When rotating keys, accept a previous signed cookie temporarily, but
+    // re-sign the same owner ID using the new current key on this response.
+    if (!isValid || process.env.ANON_COOKIE_SECRET_PREVIOUS) {
         res.cookie('lf_owner', owner, {
             signed: true, httpOnly: true, sameSite: 'lax',
             secure: process.env.NODE_ENV === 'production',
@@ -89,13 +100,15 @@ app.get('/api/lectures/:id', asyncRoute(async (req, res) => {
 }));
 app.patch('/api/lectures/:id', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
+    const body = req.body || {};
     const update = {};
-    if (typeof req.body.title === 'string') update.title = req.body.title.trim().slice(0, 120) || 'New Lecture';
-    if (typeof req.body.pinned === 'boolean') update.pinned = req.body.pinned;
-    if (typeof req.body.notesMarkdown === 'string') update.notesMarkdown = req.body.notesMarkdown.slice(0, 120000);
-    if (typeof req.body.durationSeconds === 'number' && Number.isFinite(req.body.durationSeconds)) {
-        update.durationSeconds = Math.max(0, Math.floor(req.body.durationSeconds));
+    if (typeof body.title === 'string') update.title = body.title.trim().slice(0, 120) || 'New Lecture';
+    if (typeof body.pinned === 'boolean') update.pinned = body.pinned;
+    if (typeof body.notesMarkdown === 'string') update.notesMarkdown = body.notesMarkdown.slice(0, 120000);
+    if (typeof body.durationSeconds === 'number' && Number.isFinite(body.durationSeconds)) {
+        update.durationSeconds = Math.max(0, Math.floor(body.durationSeconds));
     }
+    if (!Object.keys(update).length) return sendError(res, 400, 'No valid lecture fields supplied');
     const doc = await Lecture.findOneAndUpdate(
         { _id: req.params.id, ownerId: req.ownerId },
         { $set: update }, { returnDocument: 'after', runValidators: true }
@@ -112,7 +125,7 @@ app.delete('/api/lectures/:id', asyncRoute(async (req, res) => {
 
 app.post('/api/lectures/:id/segments', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
-    const { id, text, seconds } = req.body;
+    const { id, text, seconds } = req.body || {};
     if (typeof id !== 'string' || !id.trim() || id.length > 80 || typeof text !== 'string' || !text.trim() || text.length > 2000) {
         return sendError(res, 400, 'Invalid transcript segment');
     }
@@ -129,22 +142,67 @@ app.post('/api/lectures/:id/segments', asyncRoute(async (req, res) => {
     res.json({ ok: true });
 }));
 
-const aiLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 24, standardHeaders: 'draft-8', legacyHeaders: false });
-app.post('/api/ai/live-token', aiLimiter, asyncRoute(async (req, res) => {
+const aiLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 24,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    message: { error: 'AI request limit reached for this IP. Try again later.' }
+});
+
+// Keep this exactly matched with the config passed to sdk.live.connect()
+// in client/src/recorder.js.
+const LIVE_MODEL = 'gemini-3.5-transcribe-live';
+const LIVE_CONFIG = {
+    responseModalities: ['TEXT'],
+    inputAudioTranscription: {
+        languageCodes: [], // automatic language recognition / code switching
+        customVocabulary: [
+            'microprocessor', 'microcontroller', 'CPU', 'ALU', 'Control Unit',
+            'register file', 'program counter', 'instruction register',
+            'Von Neumann', 'Harvard architecture', 'RISC', 'CISC',
+            'address bus', 'data bus', 'control bus', 'UART', 'SPI', 'I2C'
+        ],
+        mode: 'VERBATIM'
+    }
+};
+
+function safeErrorMessage(error) {
+    let message = String(error?.message || 'Unknown error');
+    if (process.env.GEMINI_API_KEY) {
+        message = message.split(process.env.GEMINI_API_KEY).join('[REDACTED]');
+    }
+    return message.slice(0, 600);
+}
+
+function aiFailure(res, error, action) {
+    const code = Number(error?.status || error?.code);
+    console.error(`Gemini ${action} failed [${Number.isFinite(code) ? code : 'unknown'}]: ${safeErrorMessage(error)}`);
+    if (code === 400) return sendError(res, 502, `Gemini rejected the ${action} configuration. Check the backend logs.`);
+    if (code === 401 || code === 403) return sendError(res, 502, 'Gemini authentication failed. Check and replace the server API key.');
+    if (code === 404) return sendError(res, 502, 'The Gemini model is unavailable for this key/project. Check model access.');
+    if (code === 429) return sendError(res, 429, 'Gemini quota or rate limit reached. Check your Google AI Studio usage.');
+    return sendError(res, 502, `Gemini ${action} failed. Check the backend terminal for details.`);
+}
+
+app.post('/api/ai/live-token', aiLimiter, asyncRoute(async (_req, res) => {
     if (!ai) return sendError(res, 503, 'Set GEMINI_API_KEY in server/.env');
-    const vocab = ['microprocessor', 'microcontroller', 'CPU', 'ALU', 'Control Unit', 'register file', 'program counter', 'instruction register', 'Von Neumann', 'Harvard architecture', 'RISC', 'CISC', 'address bus', 'data bus', 'control bus', 'UART', 'SPI', 'I2C'];
-    const token = await ai.authTokens.create({
-        config: {
-            uses: 1,
-            expireTime: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-            liveConnectConstraints: {
-                model: 'gemini-3.5-transcribe-live',
-                config: { responseModalities: ['TEXT'], inputAudioTranscription: { languageCodes: [], customVocabulary: vocab, mode: 'VERBATIM' } }
+    try {
+        const token = await ai.authTokens.create({
+            config: {
+                uses: 1,
+                expireTime: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+                liveConnectConstraints: { model: LIVE_MODEL, config: LIVE_CONFIG }
             }
-        }
-    });
-    res.json({ token: token.name });
+        });
+        if (!token?.name) return sendError(res, 502, 'Gemini did not return a Live API token');
+        res.set('Cache-Control', 'no-store');
+        return res.json({ token: token.name });
+    } catch (error) {
+        return aiFailure(res, error, 'live-token');
+    }
 }));
+
 // Notes are generated only when the client stops the recording. This endpoint
 // processes every finalized segment, without requiring manual speaker labels.
 const NOTES_MODEL = 'gemini-3.5-flash-lite';
@@ -198,7 +256,7 @@ app.post('/api/lectures/:id/organize', aiLimiter, asyncRoute(async (req, res) =>
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
     const doc = await Lecture.findOne({ _id: req.params.id, ownerId: req.ownerId });
     if (!doc) return sendError(res, 404, 'Lecture not found');
-    if (!doc.transcript.length) return sendError(res, 400, 'There is no finalized transcript yet');
+    if (!doc.transcript.length) return sendError(res, 400, 'There is no finalized transcript yet. Audio saved locally has NOT been retranscribed.');
     if (doc.notesStatus === 'processing' && doc.notesStartedAt && (Date.now() - doc.notesStartedAt.getTime()) < 5 * 60_000) {
         return sendError(res, 409, 'Notes generation is already running');
     }
@@ -232,10 +290,11 @@ substantive ideas, definitions, and examples. Ignore unrelated conversations.\n\
         await doc.save();
         res.json(doc);
     } catch (error) {
-        doc.notesStatus = 'failed';
-        doc.notesStartedAt = null;
-        await doc.save().catch(() => { });
-        throw error;
+        await Lecture.updateOne(
+            { _id: doc._id, ownerId: req.ownerId },
+            { $set: { notesStatus: 'failed', notesStartedAt: null } }
+        ).catch(() => { });
+        return aiFailure(res, error, 'notes-generation');
     }
 }));
 
@@ -245,11 +304,13 @@ app.post('/api/lectures/:id/share', asyncRoute(async (req, res) => {
     if (!doc) return sendError(res, 404, 'Lecture not found');
     // Reuse a permanent read-only link; no separate revoke button.
     // For older documents with hash-only links, the first new share creates a fresh link.
-    if (!doc.shareToken) {
-        doc.shareToken = randomBytes(32).toString('base64url');
-        doc.shareHash = hashToken(doc.shareToken);
+    if (!doc.shareToken) doc.shareToken = randomBytes(32).toString('base64url');
+    const expectedHash = hashToken(doc.shareToken);
+    if (doc.shareHash !== expectedHash) {
+        doc.shareHash = expectedHash;
         await doc.save();
     }
+    res.set('Cache-Control', 'no-store');
     res.json({ token: doc.shareToken });
 }));
 app.get('/api/public/:token', asyncRoute(async (req, res) => {
@@ -274,9 +335,11 @@ if (process.env.NODE_ENV === 'production') {
 app.use('/api', (_req, res) => sendError(res, 404, 'API endpoint not found'));
 
 app.use((error, req, res, next) => {
-    console.error(error.message);
     if (res.headersSent) return next(error);
-    sendError(res, 500, 'Request failed. Check the backend terminal for details.');
+    if (error?.type === 'entity.too.large') return sendError(res, 413, 'Request is too large');
+    if (error instanceof SyntaxError && error?.status === 400) return sendError(res, 400, 'Malformed JSON request');
+    console.error('Backend request error:', safeErrorMessage(error));
+    return sendError(res, 500, 'Request failed. Check the backend terminal for details.');
 });
 
 const port = Number(process.env.PORT || 5000);
@@ -291,6 +354,11 @@ async function startServer() {
     }
     if (!process.env.ANON_COOKIE_SECRET || process.env.ANON_COOKIE_SECRET.length < 32) {
         console.error('Set ANON_COOKIE_SECRET to at least 32 characters in server/.env.');
+        process.exitCode = 1;
+        return;
+    }
+    if (process.env.ANON_COOKIE_SECRET_PREVIOUS && process.env.ANON_COOKIE_SECRET_PREVIOUS === process.env.ANON_COOKIE_SECRET) {
+        console.error('The previous cookie secret must differ from the current secret.');
         process.exitCode = 1;
         return;
     }

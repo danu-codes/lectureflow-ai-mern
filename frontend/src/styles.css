@@ -1354,3 +1354,103 @@ h3 {
   align-items: center;
   gap: 7px;
 }
+
+/* Accessible-looking confirmation dialog for destructive lecture deletion */
+.delete-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, .68);
+  backdrop-filter: blur(5px)
+}
+
+.delete-dialog {
+  width: min(100%, 440px);
+  border: 1px solid var(--stroke);
+  border-radius: 19px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 24px;
+  box-shadow: var(--shadow)
+}
+
+.delete-dialog-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between
+}
+
+.delete-symbol {
+  height: 48px;
+  width: 48px;
+  display: grid;
+  place-items: center;
+  background: rgba(224, 79, 92, .12);
+  border-radius: 14px;
+  color: var(--danger)
+}
+
+.delete-dialog h2 {
+  font-size: 21px;
+  margin: 17px 0 9px
+}
+
+.delete-description {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--muted);
+  margin: 0 0 24px;
+  overflow-wrap: anywhere
+}
+
+.delete-description strong {
+  color: var(--text)
+}
+
+.delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap
+}
+
+.delete-cancel,
+.delete-confirm {
+  border-radius: 10px;
+  padding: 11px 16px;
+  font-weight: 700;
+  min-height: 43px
+}
+
+.delete-cancel {
+  border: 1px solid var(--stroke);
+  background: var(--surface-2);
+  color: var(--text)
+}
+
+.delete-confirm {
+  border: 0;
+  background: #d94c59;
+  color: white;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px
+}
+
+.delete-confirm:hover:not(:disabled) {
+  background: #c53846
+}
+
+@media(max-width:440px) {
+  .delete-dialog {
+    padding: 19px
+  }
+
+  .delete-actions>button {
+    flex: 1
+  }
+}

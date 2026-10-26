@@ -63,6 +63,10 @@ export class LectureRecorder {
 
     this.media = null;
     this.live = null;
+    this.savedWrites = new Set();
+    this.finalWrites = new Set();
+    this.finishing = false;
+    this.stopped = false;
   }
 
   // ------------------------------
@@ -108,7 +112,7 @@ export class LectureRecorder {
 
       this.media.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          db.audioChunks
+          const task = db.audioChunks
             .add({
               lectureId: this.lectureId,
               blob: event.data,
@@ -121,6 +125,8 @@ export class LectureRecorder {
                 "Check available device storage."
               );
             });
+          this.savedWrites.add(task);
+          task.finally(() => this.savedWrites.delete(task)).catch(() => { });
         }
       };
 
@@ -250,7 +256,7 @@ export class LectureRecorder {
         apiKey: token,
       });
 
-      const session = await ai.live.connect({
+      const session = await sdk.live.connect({
         model: "gemini-3.5-transcribe-live",
 
         config: {
@@ -295,27 +301,36 @@ export class LectureRecorder {
               typeof content?.interimInputTranscription?.text
               === "string"
             ) {
-              callbacks.interim(
+              this.callbacks.interim(
                 content.interimInputTranscription.text
               );
             }
 
             // Completed speech is added to the transcript.
             if (content?.inputTranscription?.text) {
-              callbacks.interim("");
+              this.callbacks.interim("");
 
-              callbacks.final(
-                content.inputTranscription.text
+              const task = Promise.resolve().then(() =>
+                this.callbacks.final(content.inputTranscription.text)
               );
+              this.finalWrites.add(task);
+              task.finally(() => this.finalWrites.delete(task)).catch(() => { });
             }
           },
 
           onerror: (error) => {
             console.error("Gemini Live error:", error);
+            this.callbacks.status("Live transcription error");
+            this.callbacks.gap?.("Live transcription was interrupted.");
           },
 
           onclose: () => {
-            console.log("Gemini session closed");
+            if (this.stopping || this.version !== myVersion) return;
+            this.live = null;
+            this.callbacks.status("Reconnecting live transcription...");
+            this.callbacks.gap?.("Live transcription disconnected; check transcript for gaps.");
+            clearTimeout(this.retryTimer);
+            this.retryTimer = setTimeout(() => this.connectLive(), 2500);
           },
         },
       });
@@ -346,6 +361,10 @@ export class LectureRecorder {
       this.callbacks.error(
         `Live transcription: ${error.message}`
       );
+      this.callbacks.status("Live transcription unavailable; local audio continues");
+      this.callbacks.gap?.("Live transcription unavailable; review local audio.");
+      clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => this.connectLive(), 5000);
     }
   }
 
@@ -403,6 +422,7 @@ export class LectureRecorder {
       setTimeout(resolve, 1800)
     );
 
+    this.stopping = true;
     this.stopped = true;
     ++this.version;
 
@@ -433,13 +453,13 @@ export class LectureRecorder {
 
     this.source?.disconnect();
     this.worklet?.disconnect();
-    this.silencer?.disconnect();
+    this.gain?.disconnect();
 
     await this.context?.close().catch(() => { });
 
     await Promise.allSettled([
-      ...this.savedWrites,
-      ...this.finalWrites,
+      ...Array.from(this.savedWrites),
+      ...Array.from(this.finalWrites),
     ]);
 
     this.callbacks.interim("");

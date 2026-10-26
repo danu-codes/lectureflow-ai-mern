@@ -10,6 +10,7 @@ import { api } from './api';
 import { db, downloadLocalAudio } from './db';
 import { LectureRecorder } from './recorder';
 import RenameModal from './RenameModal';
+import DeleteModal from './DeleteModal';
 
 const fmt = (seconds = 0) => `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 function stripRepeatedTitle(markdown, title) {
@@ -64,6 +65,7 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [audioCount, setAudioCount] = useState(0);
   const [renameTarget, setRenameTarget] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
   const [gapWarning, setGapWarning] = useState('');
   const recorderRef = useRef(null);
   const currentIdRef = useRef(null);
@@ -182,7 +184,6 @@ export default function App() {
   }
   async function deleteLecture(id, title) {
     if (recordingRef.current !== 'idle') return;
-    if (!confirm(`Permanently delete "${title}"? Its local audio on this browser will also be deleted.`)) return;
     try {
       await api(`/lectures/${id}`, { method: 'DELETE' });
       await Promise.all([
@@ -191,7 +192,8 @@ export default function App() {
       ]);
       if (activeId === id) { setActiveId(null); setLecture(null); }
       await loadList(query);
-    } catch (e) { alertError(e); }
+      setDeleteTarget(null);
+    } catch (e) { alertError(e); throw e; }
   }
   async function shareLecture(id = lecture?._id, title = lecture?.title) {
     try {
@@ -340,7 +342,7 @@ export default function App() {
         <button onClick={() => togglePin(item._id, item.pinned)} disabled={running}><Pin size={15} /> {item.pinned ? 'Unpin' : 'Pin'}</button>
         <button onClick={() => makePdf(item._id)}><FileDown size={15} /> Export PDF</button>
         <button onClick={() => shareLecture(item._id, item.title)}><Share2 size={15} /> Share view-only</button>
-        <button onClick={() => deleteLecture(item._id, item.title)} disabled={running} className="danger"><Trash2 size={15} /> Delete</button>
+        <button onClick={() => setDeleteTarget({ id: item._id, title: item.title })} disabled={running} className="danger"><Trash2 size={15} /> Delete</button>
       </div>
     </details>
   </div>;
@@ -384,7 +386,7 @@ export default function App() {
             <IconButton title="Rename" disabled={running} onClick={() => rename(lecture._id, lecture.title)}><Pencil size={18} /></IconButton>
             <IconButton title={lecture.pinned ? 'Unpin' : 'Pin'} disabled={running} onClick={() => togglePin(lecture._id, lecture.pinned)}><Pin size={18} className={lecture.pinned ? 'accent' : ''} /></IconButton>
             <IconButton title="Share read-only link" disabled={running} onClick={() => shareLecture(lecture._id, lecture.title)}><Share2 size={18} /></IconButton>
-            <IconButton title="Export PDF" onClick={makePdf}><FileDown size={18} /></IconButton>
+            <IconButton title="Export PDF" onClick={() => makePdf(lecture._id)}><FileDown size={18} /></IconButton>
           </div></div>
 
         <section className={`record-card ${running ? 'is-recording' : ''}`}>
@@ -434,10 +436,11 @@ export default function App() {
         </div>}
         <div className="lecture-footer">
           <button className="small-action" onClick={() => downloadLocalAudio(lecture._id, lecture.title).catch(alertError)} disabled={!audioCount || running}><Download size={16} /> Download local audio {audioCount ? `(${audioCount} chunks)` : ''}</button>
-          <button className="small-action danger-text" disabled={running} onClick={() => deleteLecture(lecture._id, lecture.title)}><Trash2 size={16} /> Delete lecture</button>
+          <button className="small-action danger-text" disabled={running} onClick={() => setDeleteTarget({ id: lecture._id, title: lecture.title })}><Trash2 size={16} /> Delete lecture</button>
         </div>
       </section>}
     </main>
     {renameTarget && <RenameModal value={renameTarget} onCancel={() => setRenameTarget(null)} onSave={saveRename} />}
+    {deleteTarget && <DeleteModal value={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={deleteLecture} />}
   </div>;
 }
