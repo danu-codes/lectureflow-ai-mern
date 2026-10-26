@@ -1,1528 +1,421 @@
-
+import { useCallback, useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
 import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+  AudioLines, BookOpenText, Check, CircleHelp,
+  Download, Ellipsis, FileDown, FileText, Menu, Mic,
+  Moon, Pause, Pin, Play, Plus, Search, Share2, Sparkles,
+  Square, Sun, Trash2, X, Pencil
+} from 'lucide-react';
+import { api } from './api';
+import { db, downloadLocalAudio } from './db';
+import { LectureRecorder } from './recorder';
+import RenameModal from './RenameModal';
 
-import ReactMarkdown from "react-markdown";
-
-import {
-  AudioLines,
-  BookOpenText,
-  Check,
-  Cloud,
-  Download,
-  Ellipsis,
-  FileDown,
-  FileText,
-  Menu,
-  Mic,
-  Moon,
-  Pause,
-  Pin,
-  Play,
-  Plus,
-  Search,
-  Share2,
-  Sparkles,
-  Square,
-  Sun,
-  Trash2,
-  X,
-  Pencil,
-  RotateCw,
-} from "lucide-react";
-
-import { api } from "./api";
-import { db, downloadLocalAudio } from "./db";
-import { LectureRecorder } from "./recorder";
-import { exportPdf } from "./exportPdf";
-
-const formatTime = (seconds = 0) => {
-  const hrs = Math.floor(seconds / 3600);
-  const mins = Math.floor(seconds / 60) % 60;
-  const secs = Math.floor(seconds % 60);
-
-  return [hrs, mins, secs]
-    .map((number) =>
-      String(number).padStart(2, "0")
-    )
-    .join(":");
-};
-
-const formatDate = (value) =>
-  new Date(value).toLocaleDateString(
-    undefined,
-    {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    }
-  );
-
-function IconButton({
-  title,
-  children,
-  onClick,
-  disabled,
-}) {
-  return (
-    <button
-      type="button"
-      className="icon-button"
-      title={title}
-      aria-label={title}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      {children}
-    </button>
-  );
+const fmt = (seconds = 0) => `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+function stripRepeatedTitle(markdown, title) {
+  const source = (markdown || '').trimStart();
+  const match = source.match(/^#{1,3}\s+(.+?)\s*(?:\r?\n|$)/);
+  const normalize = text => (text || '').replace(/[\*_`]/g, '').trim().toLocaleLowerCase();
+  return match && normalize(match[1]) === normalize(title)
+    ? source.slice(match[0].length).trimStart()
+    : source;
 }
+const shownDate = str => new Date(str).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
-// ------------------------------
-// Read-only public lecture page
-// ------------------------------
+function IconButton({ title, onClick, disabled, children, className = '' }) {
+  return <button type="button" title={title} aria-label={title} onClick={onClick} disabled={disabled} className={`icon-button ${className}`}>{children}</button>;
+}
 
 function PublicLecture() {
   const [lecture, setLecture] = useState(null);
-  const [error, setError] = useState("");
-
+  const [error, setError] = useState('');
   useEffect(() => {
-    const token =
-      window.location.pathname.split("/share/")[1];
-
-    api(`/public/${encodeURIComponent(token || "")}`)
-      .then(setLecture)
-      .catch((err) => setError(err.message));
+    const token = location.pathname.split('/share/')[1] || '';
+    api(`/public/${encodeURIComponent(token)}`).then(setLecture).catch(e => setError(e.message));
   }, []);
-
-  const content = lecture
-    ? lecture.notesMarkdown ||
-    lecture.transcript
-      ?.map((segment) => segment.text)
-      .join("\n\n") ||
-    "No notes available."
-    : "";
-
-  return (
-    <div className="public-page">
-      <header className="public-top">
-        <AudioLines size={24} />
-        <strong>LectureFlow AI</strong>
-        <span>Shared lecture · View only</span>
-      </header>
-
-      <article className="public-paper">
-        {error ? (
-          <p className="error-box">{error}</p>
-        ) : !lecture ? (
-          <p>Loading shared lecture...</p>
-        ) : (
-          <>
-            <p className="eyebrow">
-              LECTURE NOTES ·
-              {" " + formatDate(lecture.createdAt)}
-            </p>
-
-            <h1>{lecture.title}</h1>
-
-            <div className="markdown-body">
-              <ReactMarkdown>
-                {content}
-              </ReactMarkdown>
-            </div>
-
-            <div className="viewer-note">
-              This is a read-only lecture.
-              The recording is stored only
-              on the original device.
-            </div>
-          </>
-        )}
-      </article>
-    </div>
-  );
+  return <div className="public-page">
+    <div className="public-top"><AudioLines size={23} /> <strong>LectureFlow AI</strong><span>Shared lecture · View only</span></div>
+    <article className="public-paper">
+      {error ? <div className="error-box">{error}</div> : !lecture ? <p>Loading shared lecture...</p> : <>
+        <p className="eyebrow">LECTURE NOTES · {shownDate(lecture.createdAt)}</p>
+        <h1>{lecture.title}</h1>
+        <div className="markdown-body"><ReactMarkdown>{stripRepeatedTitle(lecture.notesMarkdown, lecture.title) || lecture.transcript?.map(s => s.text).join('\n\n') || 'No notes yet.'}</ReactMarkdown></div>
+        <div className="viewer-note">This page is read-only. Audio is stored on the recording device and is never shared.</div>
+      </>}
+    </article>
+  </div>;
 }
 
-// ------------------------------
-// Main application
-// ------------------------------
-
 export default function App() {
-  const publicView =
-    window.location.pathname.startsWith("/share/");
-
-  // UI state
-
-  const [theme, setTheme] = useState(
-    () => localStorage.getItem("lf_theme") || "dark"
-  );
-
+  const [theme, setTheme] = useState(() => localStorage.getItem('lf_theme') || 'dark');
   const [mobileNav, setMobileNav] = useState(false);
   const [list, setList] = useState([]);
-  const [query, setQuery] = useState("");
-
+  const [query, setQuery] = useState('');
   const [activeId, setActiveId] = useState(null);
   const [lecture, setLecture] = useState(null);
-
-  const [tab, setTab] = useState("transcript");
-
-  const [recordState, setRecordState] =
-    useState("idle");
-
-  const [liveStatus, setLiveStatus] =
-    useState("Ready");
-
-  const [interim, setInterim] = useState("");
+  const [tab, setTab] = useState('transcript');
+  const [recordState, setRecordState] = useState('idle');
+  const [liveStatus, setLiveStatus] = useState('Ready');
+  const [interim, setInterim] = useState('');
   const [seconds, setSeconds] = useState(0);
-
-  const [error, setError] = useState("");
+  const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
-
+  const [draft, setDraft] = useState('');
   const [audioCount, setAudioCount] = useState(0);
-
-  // Refs for recording callbacks
-
+  const [renameTarget, setRenameTarget] = useState(null);
+  const [gapWarning, setGapWarning] = useState('');
   const recorderRef = useRef(null);
+  const currentIdRef = useRef(null);
   const secondsRef = useRef(0);
-  const recordingRef = useRef("idle");
-  const flushingRef = useRef(false);
-
-  const isRecording = recordState !== "idle";
-
-  const showError = (err) => {
-    setError(err?.message || String(err));
-  };
-
-  // ------------------------------
-  // Theme selection
-  // ------------------------------
+  const flushPromiseRef = useRef(null);
+  const recordingRef = useRef('idle');
+  const publicView = location.pathname.startsWith('/share/');
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("lf_theme", theme);
+    localStorage.setItem('lf_theme', theme);
   }, [theme]);
+  const alertError = e => setError(e?.message || String(e));
 
-  function toggleTheme() {
-    setTheme((previous) =>
-      previous === "dark" ? "light" : "dark"
-    );
-  }
-
-  // ------------------------------
-  // Fetch MongoDB lecture history
-  // ------------------------------
-
-  const loadList = useCallback(
-    async (search = "") => {
-      const endpoint = search
-        ? `/lectures?q=${encodeURIComponent(search)}`
-        : "/lectures";
-
-      const result = await api(endpoint);
-      setList(result);
-    },
-    []
-  );
+  const loadList = useCallback(async (q = '') => {
+    const docs = await api(`/lectures${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+    setList(docs);
+  }, []);
 
   useEffect(() => {
     if (publicView) return;
-
-    const timer = setTimeout(() => {
-      loadList(query).catch(showError);
-    }, 250);
-
+    const timer = setTimeout(() => loadList(query).catch(alertError), 260);
     return () => clearTimeout(timer);
   }, [query, loadList, publicView]);
 
-  // ------------------------------
-  // Fetch selected lecture
-  // ------------------------------
-
   useEffect(() => {
-    if (!activeId || publicView) return;
-
+    if (publicView || !activeId) return;
     let cancelled = false;
-
-    api(`/lectures/${activeId}`)
-      .then((doc) => {
-        if (
-          cancelled ||
-          recordingRef.current !== "idle"
-        ) {
-          return;
-        }
-
-        setLecture(doc);
-        setDraft(doc.notesMarkdown || "");
-
-        const duration = doc.durationSeconds || 0;
-
-        setSeconds(duration);
-        secondsRef.current = duration;
-      })
-      .catch(showError);
-
-    db.audioChunks
-      .where("lectureId")
-      .equals(activeId)
-      .count()
-      .then((count) => {
-        if (!cancelled) {
-          setAudioCount(count);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
+    api(`/lectures/${activeId}`).then(doc => {
+      if (!cancelled && recordingRef.current === 'idle') {
+        setLecture(doc); setDraft(doc.notesMarkdown || '');
+        setSeconds(doc.durationSeconds || 0);
+        secondsRef.current = doc.durationSeconds || 0;
+      }
+    }).catch(alertError);
+    db.audioChunks.where('lectureId').equals(activeId).count().then(count => {
+      if (!cancelled) setAudioCount(count);
+    });
+    return () => { cancelled = true; };
   }, [activeId, publicView]);
 
-  // ------------------------------
-  // Recording duration timer
-  // ------------------------------
-
   useEffect(() => {
-    if (recordState !== "recording") return;
-
+    if (recordState !== 'recording') return;
     const timer = setInterval(() => {
       secondsRef.current += 1;
       setSeconds(secondsRef.current);
     }, 1000);
-
     return () => clearInterval(timer);
   }, [recordState]);
 
-  // ------------------------------
-  // Retry unsaved transcript text
-  // ------------------------------
-
   const flushPending = useCallback(async () => {
-    if (flushingRef.current) return;
-
-    flushingRef.current = true;
-
-    try {
-      const pending =
-        await db.pendingSegments.toArray();
-
+    if (flushPromiseRef.current) return flushPromiseRef.current;
+    const sendQueued = async () => {
+      const pending = await db.pendingSegments.toArray();
       for (const item of pending) {
         try {
-          await api(
-            `/lectures/${item.lectureId}/segments`,
-            {
-              method: "POST",
-              body: item.segment,
-            }
-          );
-
+          await api(`/lectures/${item.lectureId}/segments`, { method: 'POST', body: item.segment });
           await db.pendingSegments.delete(item.id);
         } catch {
+          // Preserve the local queue; retry on the next interval or online event.
           break;
         }
       }
-    } finally {
-      flushingRef.current = false;
-    }
+    };
+    flushPromiseRef.current = sendQueued();
+    try { await flushPromiseRef.current; }
+    finally { flushPromiseRef.current = null; }
   }, []);
-
   useEffect(() => {
     if (publicView) return;
-
     flushPending();
-
-    const timer = setInterval(
-      flushPending,
-      10000
-    );
-
-    window.addEventListener(
-      "online",
-      flushPending
-    );
-
-    return () => {
-      clearInterval(timer);
-
-      window.removeEventListener(
-        "online",
-        flushPending
-      );
-    };
-  }, [flushPending, publicView]);
-
-  // ------------------------------
-  // Select lecture
-  // ------------------------------
+    const t = setInterval(flushPending, 10000);
+    window.addEventListener('online', flushPending);
+    return () => { clearInterval(t); window.removeEventListener('online', flushPending); };
+  }, [publicView, flushPending]);
 
   function selectLecture(id) {
-    if (recordingRef.current !== "idle") return;
-
-    setActiveId(id);
-    setLecture(null);
-    setMobileNav(false);
-
-    setTab("transcript");
-    setInterim("");
-    setError("");
-    setEditing(false);
+    if (recordingRef.current !== 'idle') return;
+    setActiveId(id); setMobileNav(false); setInterim(''); setError(''); setEditing(false);
+    setLecture(null); setTab('transcript');
   }
-
-  // ------------------------------
-  // New lecture
-  // ------------------------------
-
   async function createLecture() {
-    if (recordingRef.current !== "idle") return;
-
+    if (recordingRef.current !== 'idle') return;
     try {
-      const doc = await api("/lectures", {
-        method: "POST",
-      });
-
-      setList((previous) => [
-        doc,
-        ...previous,
-      ]);
-
-      setLecture(doc);
-      setActiveId(doc._id);
-
-      setTab("transcript");
-      setMobileNav(false);
-      setInterim("");
-      setError("");
-
-      setSeconds(0);
-      secondsRef.current = 0;
-
+      const doc = await api('/lectures', { method: 'POST' });
+      setList(prev => [doc, ...prev]);
+      setLecture(doc); setActiveId(doc._id); setTab('transcript'); setInterim('');
+      setMobileNav(false); setError(''); setSeconds(0); secondsRef.current = 0;
       setAudioCount(0);
-    } catch (err) {
-      showError(err);
-    }
+    } catch (e) { alertError(e); }
   }
-
-  // ------------------------------
-  // Rename lecture
-  // ------------------------------
-
-  async function renameLecture(id, oldTitle) {
-    if (isRecording) return;
-
-    const title = window.prompt(
-      "Enter a lecture title:",
-      oldTitle
-    );
-
-    if (!title?.trim()) return;
-
+  async function patch(changes) {
+    if (!lecture) return;
+    const doc = await api(`/lectures/${lecture._id}`, { method: 'PATCH', body: changes });
+    setLecture(doc); await loadList(query);
+    return doc;
+  }
+  function rename(id, oldTitle) {
+    if (recordingRef.current !== 'idle') return;
+    setRenameTarget({ id, title: oldTitle });
+  }
+  async function saveRename(id, title) {
     try {
-      const updated = await api(
-        `/lectures/${id}`,
-        {
-          method: "PATCH",
-          body: { title: title.trim() },
-        }
-      );
-
-      if (id === activeId) {
-        setLecture(updated);
-      }
-
+      const updated = await api(`/lectures/${id}`, { method: 'PATCH', body: { title } });
+      if (id === activeId) setLecture(updated);
       await loadList(query);
-    } catch (err) {
-      showError(err);
-    }
+    } catch (e) { alertError(e); throw e; }
   }
-
-  // ------------------------------
-  // Pin or unpin
-  // ------------------------------
-
-  async function togglePin(id, pinned) {
-    if (isRecording) return;
-
+  async function markSpeaker(segmentId, speaker) {
+    if (!lecture) return;
     try {
-      const updated = await api(
-        `/lectures/${id}`,
-        {
-          method: "PATCH",
-          body: { pinned: !pinned },
-        }
-      );
-
-      if (id === activeId) {
-        setLecture(updated);
-      }
-
-      await loadList(query);
-    } catch (err) {
-      showError(err);
-    }
-  }
-
-  // ------------------------------
-  // Delete lecture and local audio
-  // ------------------------------
-
-  async function deleteLecture(id, title) {
-    if (isRecording) return;
-
-    const confirmed = window.confirm(
-      `Delete "${title}" permanently?\n` +
-      "The local audio will also be deleted."
-    );
-
-    if (!confirmed) return;
-
-    try {
-      await api(`/lectures/${id}`, {
-        method: "DELETE",
+      await api(`/lectures/${lecture._id}/segments/${encodeURIComponent(segmentId)}`, {
+        method: 'PATCH', body: { speaker }
       });
-
-      await Promise.all([
-        db.audioChunks
-          .where("lectureId")
-          .equals(id)
-          .delete(),
-
-        db.pendingSegments
-          .where("lectureId")
-          .equals(id)
-          .delete(),
-      ]);
-
-      if (activeId === id) {
-        setActiveId(null);
-        setLecture(null);
-      }
-
+      setLecture(prev => prev && ({
+        ...prev, transcript: prev.transcript.map(s => s.id === segmentId ? { ...s, speaker } : s)
+      }));
+    } catch (e) { alertError(e); }
+  }
+  async function togglePin(id, pinned) {
+    try {
+      const updated = await api(`/lectures/${id}`, { method: 'PATCH', body: { pinned: !pinned } });
+      if (id === activeId) setLecture(updated);
       await loadList(query);
-    } catch (err) {
-      showError(err);
-    }
+    } catch (e) { alertError(e); }
   }
-
-  // ------------------------------
-  // Save notes
-  // ------------------------------
-
-  async function saveNotes() {
-    if (!lecture) return;
-
+  async function deleteLecture(id, title) {
+    if (recordingRef.current !== 'idle') return;
+    if (!confirm(`Permanently delete "${title}"? Its local audio on this browser will also be deleted.`)) return;
     try {
-      const doc = await api(
-        `/lectures/${lecture._id}`,
-        {
-          method: "PATCH",
-          body: {
-            notesMarkdown: draft,
-          },
-        }
-      );
-
-      setLecture(doc);
-      setEditing(false);
-    } catch (err) {
-      showError(err);
-    }
+      await api(`/lectures/${id}`, { method: 'DELETE' });
+      await Promise.all([
+        db.audioChunks.where('lectureId').equals(id).delete(),
+        db.pendingSegments.where('lectureId').equals(id).delete()
+      ]);
+      if (activeId === id) { setActiveId(null); setLecture(null); }
+      await loadList(query);
+    } catch (e) { alertError(e); }
   }
-
-  // ------------------------------
-  // Export any lecture as PDF
-  // ------------------------------
-
-  async function handlePdf(id) {
+  async function shareLecture(id = lecture?._id, title = lecture?.title) {
     try {
-      const doc =
-        lecture?._id === id
-          ? lecture
-          : await api(`/lectures/${id}`);
-
-      exportPdf(doc);
-    } catch (err) {
-      showError(err);
-    }
+      const { token } = await api(`/lectures/${id}/share`, { method: 'POST' });
+      const url = `${location.origin}/share/${token}`;
+      if (navigator.share) await navigator.share({ title, url });
+      else if (navigator.clipboard) { await navigator.clipboard.writeText(url); alert('Read-only sharing link copied.'); }
+      else prompt('Copy this read-only link:', url);
+      await loadList(query);
+    } catch (e) { if (e.name !== 'AbortError') alertError(e); }
   }
-
-  // ------------------------------
-  // Create read-only share link
-  // ------------------------------
-
-  async function shareLecture(id, title) {
-    try {
-      const { token } = await api(
-        `/lectures/${id}/share`,
-        { method: "POST" }
-      );
-
-      const url =
-        `${window.location.origin}/share/${token}`;
-
-      if (navigator.share) {
-        await navigator.share({
-          title,
-          url,
-        });
-      } else if (navigator.clipboard) {
-        await navigator.clipboard.writeText(url);
-        window.alert("Sharing link copied!");
-      } else {
-        window.prompt(
-          "Copy this read-only link:",
-          url
-        );
-      }
-    } catch (err) {
-      if (err.name !== "AbortError") {
-        showError(err);
-      }
-    }
-  }
-
-  // ------------------------------
-  // Revoke sharing
-  // ------------------------------
-
-  async function revokeShare() {
-    if (!lecture) return;
-
-    if (
-      !window.confirm(
-        "Revoke the currently active sharing link?"
-      )
-    ) {
-      return;
-    }
-
-    try {
-      await api(
-        `/lectures/${lecture._id}/share`,
-        { method: "DELETE" }
-      );
-
-      window.alert("Sharing link revoked.");
-    } catch (err) {
-      showError(err);
-    }
-  }
-
-  // ------------------------------
-  // Generate AI lecture notes
-  // ------------------------------
-
   async function organizeNotes() {
-    if (!lecture || isRecording) return;
-
-    setBusy(true);
-    setError("");
-
+    if (!lecture || recordState !== 'idle') return;
+    setBusy(true); setError('');
     try {
       await flushPending();
-
-      const unsaved = await db.pendingSegments
-        .where("lectureId")
-        .equals(lecture._id)
-        .count();
-
-      if (unsaved) {
-        throw new Error(
-          "Some transcript segments are not saved " +
-          "to MongoDB. Retry when online."
-        );
-      }
-
-      const doc = await api(
-        `/lectures/${lecture._id}/organize`,
-        { method: "POST" }
-      );
-
-      setLecture(doc);
-      setDraft(doc.notesMarkdown);
-
-      setTab("notes");
-
+      const unsaved = await db.pendingSegments.where('lectureId').equals(lecture._id).count();
+      if (unsaved) throw new Error('Some transcript text has not reached MongoDB. Connect to the internet and retry.');
+      const doc = await api(`/lectures/${lecture._id}/organize`, { method: 'POST' });
+      setLecture(doc); setDraft(doc.notesMarkdown); setTab('notes');
       await loadList(query);
-    } catch (err) {
-      showError(err);
-    } finally {
-      setBusy(false);
-    }
+    } catch (e) { alertError(e); }
+    finally { setBusy(false); }
   }
-
-  // ------------------------------
-  // Start recording
-  // ------------------------------
 
   async function startRecording() {
-    if (
-      !lecture ||
-      recordingRef.current !== "idle"
-    ) {
-      return;
-    }
-
-    setError("");
-    setInterim("");
-    setTab("transcript");
-
-    const lectureId = lecture._id;
-
-    const recorder = new LectureRecorder(
-      lectureId,
-      {
-        interim: setInterim,
-        status: setLiveStatus,
-        error: setError,
-
-        // Called when Gemini finalizes
-        // one transcript segment.
-
-        final: async (text) => {
-          const segment = {
-            id: crypto.randomUUID(),
-            text,
-            seconds: secondsRef.current,
-          };
-
-          // Immediately display confirmed text.
-
-          setLecture((previous) => {
-            if (previous?._id !== lectureId) {
-              return previous;
-            }
-
-            return {
-              ...previous,
-              transcript: [
-                ...(previous.transcript || []),
-                segment,
-              ],
-            };
-          });
-
-          // Queue locally before sending to
-          // MongoDB to support retries.
-
-          try {
-            await db.pendingSegments.put({
-              id: segment.id,
-              lectureId,
-              segment,
-            });
-
-            await flushPending();
-          } catch (err) {
-            showError(err);
-          }
-        },
+    if (!lecture || recordingRef.current !== 'idle') return;
+    setError(''); setInterim(''); setGapWarning(''); setTab('transcript');
+    const rec = new LectureRecorder(lecture._id, {
+      interim: setInterim,
+      status: setLiveStatus,
+      error: setError,
+      gap: setGapWarning,
+      final: async text => {
+        const segment = { id: crypto.randomUUID(), text, seconds: secondsRef.current };
+        setLecture(prev => prev?._id === lecture._id ?
+          { ...prev, transcript: [...(prev.transcript || []), segment] } : prev);
+        try {
+          await db.pendingSegments.put({ id: segment.id, lectureId: lecture._id, segment });
+          await flushPending();
+        } catch (e) { alertError(e); }
       }
-    );
-
-    recorderRef.current = recorder;
-    recordingRef.current = "starting";
-
-    setRecordState("starting");
-
+    });
+    recorderRef.current = rec;
+    recordingRef.current = 'starting';
+    setRecordState('starting');
     try {
-      await recorder.start();
-
-      if (recordingRef.current === "starting") {
-        recordingRef.current = "recording";
-        setRecordState("recording");
+      await rec.start();
+      if (recordingRef.current === 'starting') {
+        recordingRef.current = 'recording';
+        setRecordState('recording');
       }
-    } catch (err) {
-      recorderRef.current = null;
-      recordingRef.current = "idle";
-
-      setRecordState("idle");
-      showError(err);
+    }
+    catch (e) {
+      recordingRef.current = 'idle'; setRecordState('idle');
+      recorderRef.current = null; alertError(e);
     }
   }
-
-  // ------------------------------
-  // Pause / resume
-  // ------------------------------
-
   function togglePause() {
-    const recorder = recorderRef.current;
-
-    if (!recorder) return;
-
-    if (recordingRef.current === "recording") {
-      recorder.pause();
-
-      recordingRef.current = "paused";
-      setRecordState("paused");
-    } else if (
-      recordingRef.current === "paused"
-    ) {
-      recorder.resume();
-
-      recordingRef.current = "recording";
-      setRecordState("recording");
+    if (!recorderRef.current) return;
+    if (recordingRef.current === 'recording') {
+      recorderRef.current.pause();
+      recordingRef.current = 'paused'; setRecordState('paused');
+    } else if (recordingRef.current === 'paused') {
+      recorderRef.current.resume();
+      recordingRef.current = 'recording'; setRecordState('recording');
     }
   }
-
-  // ------------------------------
-  // Stop recording
-  // ------------------------------
-
   async function stopRecording() {
-    if (!recorderRef.current || !lecture) {
-      return;
-    }
-
-    const lectureId = lecture._id;
-
-    recordingRef.current = "stopping";
-    setRecordState("stopping");
-
+    if (!recorderRef.current) return;
+    recordingRef.current = 'stopping'; setRecordState('stopping');
     try {
       await recorderRef.current.stop();
-
       await flushPending();
-
-      const doc = await api(
-        `/lectures/${lectureId}`,
-        {
-          method: "PATCH",
-          body: {
-            durationSeconds:
-              secondsRef.current,
-          },
-        }
-      );
-
-      // Preserve text still pending locally.
-
-      setLecture((previous) => {
-        if (previous?._id !== lectureId) {
-          return previous;
-        }
-
-        const missing = (
-          previous.transcript || []
-        ).filter(
-          (segment) =>
-            !doc.transcript.some(
-              (saved) =>
-                saved.id === segment.id
-            )
-        );
-
-        return {
-          ...doc,
-          transcript: [
-            ...doc.transcript,
-            ...missing,
-          ],
-        };
+      const doc = await api(`/lectures/${lecture._id}`, {
+        method: 'PATCH',
+        body: { durationSeconds: secondsRef.current }
       });
-
-      setAudioCount(
-        await db.audioChunks
-          .where("lectureId")
-          .equals(lectureId)
-          .count()
-      );
-
+      // Merge any locally displayed segments in case a final upload is still pending.
+      setLecture(prev => prev?._id === doc._id ? {
+        ...doc,
+        transcript: [...doc.transcript, ...(prev.transcript || []).filter(s => !doc.transcript.some(r => r.id === s.id))]
+      } : prev);
       await loadList(query);
-    } catch (err) {
-      showError(err);
-    } finally {
+      setAudioCount(await db.audioChunks.where('lectureId').equals(lecture._id).count());
+    } catch (e) { alertError(e); }
+    finally {
       recorderRef.current = null;
-      recordingRef.current = "idle";
-
-      setRecordState("idle");
-      setInterim("");
+      recordingRef.current = 'idle'; setRecordState('idle'); setInterim('');
     }
   }
-
-  // ------------------------------
-  // Shared public view
-  // ------------------------------
-
-  if (publicView) {
-    return <PublicLecture />;
+  async function makePdf(id = lecture?._id) {
+    if (!id) return;
+    try {
+      const doc = lecture?._id === id ? lecture : await api(`/lectures/${id}`);
+      const { exportPdf } = await import('./exportPdf');
+      exportPdf(doc);
+    } catch (e) { alertError(e); }
   }
 
-  const pinned = list.filter(
-    (item) => item.pinned
-  );
+  if (publicView) return <PublicLecture />;
+  const hasLecture = Boolean(lecture);
+  const running = recordState !== 'idle';
+  const listPinned = list.filter(x => x.pinned);
+  const listOther = list.filter(x => !x.pinned);
+  const sidebarItem = item => <div key={item._id} className={`chat-row ${activeId === item._id ? 'active' : ''}`}>
+    <button className="chat-name" onClick={() => selectLecture(item._id)} disabled={running} title={item.title}>
+      <FileText size={16} /> <span>{item.title}</span>
+    </button>
+    <details className="chat-options">
+      <summary title="Chat actions"><Ellipsis size={18} /></summary>
+      <div className="menu-pop">
+        <button onClick={() => rename(item._id, item.title)} disabled={running}><Pencil size={15} /> Rename</button>
+        <button onClick={() => togglePin(item._id, item.pinned)} disabled={running}><Pin size={15} /> {item.pinned ? 'Unpin' : 'Pin'}</button>
+        <button onClick={() => makePdf(item._id)}><FileDown size={15} /> Export PDF</button>
+        <button onClick={() => shareLecture(item._id, item.title)}><Share2 size={15} /> Share view-only</button>
+        <button onClick={() => deleteLecture(item._id, item.title)} disabled={running} className="danger"><Trash2 size={15} /> Delete</button>
+      </div>
+    </details>
+  </div>;
 
-  const recent = list.filter(
-    (item) => !item.pinned
-  );
+  return <div className="app-shell">
+    {mobileNav && <button className="sidebar-overlay" aria-label="Close menu" onClick={() => setMobileNav(false)} />}
+    <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
+      <div className="brand"><span className="brand-icon"><AudioLines size={21} /></span><span>LectureFlow <b>AI</b></span>
+        <IconButton className="mobile-close" title="Close menu" onClick={() => setMobileNav(false)}><X size={19} /></IconButton>
+      </div>
+      <button className="new-button" onClick={createLecture} disabled={running}><Plus size={19} /> New lecture</button>
+      <div className="search-box"><Search size={17} /><input aria-label="Search lectures" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search your lectures..." /></div>
+      <div className="chat-list">
+        {!!listPinned.length && <><div className="group-label"><Pin size={12} /> PINNED</div>{listPinned.map(sidebarItem)}</>}
+        <div className="group-label">RECENT LECTURES</div>
+        {listOther.length ? listOther.map(sidebarItem) : <p className="empty-side">No lectures found.</p>}
+      </div>
+      <div className="sidebar-footer"><span className="privacy-hint">Your audio stays on this device.</span></div>
+    </aside>
 
-  // ------------------------------
-  // Sidebar lecture item
-  // ------------------------------
+    <main className="main">
+      <header className="topbar">
+        <div className="topbar-left"><IconButton className="mobile-menu" title="Open menu" onClick={() => setMobileNav(true)}><Menu size={21} /></IconButton>
+          <span className="topbar-title">{lecture?.title || 'My lectures'}</span></div>
+        <div className="topbar-right"><IconButton title="Switch theme" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</IconButton></div>
+      </header>
+      {gapWarning && <div className="gap-banner" role="status">
+        <span><strong>Review recording:</strong> {gapWarning} Your local audio is kept on this device.</span>
+        <button type="button" onClick={() => setGapWarning('')} aria-label="Dismiss recording warning"><X size={16} /></button>
+      </div>}
+      {error && <div className="error-banner"><CircleHelp size={18} /><span>{error}</span><IconButton title="Dismiss" onClick={() => setError('')}><X size={16} /></IconButton></div>}
+      {!activeId ? <section className="welcome">
+        <div className="welcome-icon"><Mic size={28} /></div>
+        <h1>Never miss a lecture note.</h1><p>Record lectures, follow the live transcript, and turn speech into organized notes with Gemini AI.</p>
+        <button className="primary-button" onClick={createLecture}><Plus size={19} /> Start a new lecture</button>
+        <div className="welcome-features"><span><Check size={16} /> Live transcript</span><span><Check size={16} /> Auto-saved notes</span><span><Check size={16} /> Local audio</span></div>
+      </section> : !hasLecture ? <div className="loading-state">Loading lecture...</div> : <section className="workspace">
+        <div className="lecture-heading"><div><p className="eyebrow">LECTURE SESSION · {shownDate(lecture.createdAt)}</p><h1>{lecture.title}</h1>
+          <p className="lecture-meta">{fmt(seconds)} recorded · {lecture.transcript?.length || 0} confirmed segments</p></div>
+          <div className="action-row">
+            <IconButton title="Rename" disabled={running} onClick={() => rename(lecture._id, lecture.title)}><Pencil size={18} /></IconButton>
+            <IconButton title={lecture.pinned ? 'Unpin' : 'Pin'} disabled={running} onClick={() => togglePin(lecture._id, lecture.pinned)}><Pin size={18} className={lecture.pinned ? 'accent' : ''} /></IconButton>
+            <IconButton title="Share read-only link" disabled={running} onClick={() => shareLecture(lecture._id, lecture.title)}><Share2 size={18} /></IconButton>
+            <IconButton title="Export PDF" onClick={makePdf}><FileDown size={18} /></IconButton>
+          </div></div>
 
-  const renderLectureItem = (item) => (
-    <div
-      key={item._id}
-      className={
-        "chat-row " +
-        (activeId === item._id ? "active" : "")
-      }
-    >
-      <button
-        className="chat-name"
-        onClick={() => selectLecture(item._id)}
-        disabled={isRecording}
-        title={item.title}
-      >
-        <FileText size={16} />
-        <span>{item.title}</span>
-      </button>
+        <section className={`record-card ${running ? 'is-recording' : ''}`}>
+          <div className="record-info"><div className="record-indicator"><span className={running && recordState === 'recording' ? 'red-dot' : 'muted-dot'} /> {running ? (recordState === 'starting' ? 'Starting...' : recordState === 'paused' ? 'Paused' : recordState === 'stopping' ? 'Finishing...' : 'Recording') : 'Ready to record'}</div><strong className="timer">{fmt(seconds)}</strong></div>
+          <div className="waveform" aria-hidden="true">{Array.from({ length: 64 }, (_, i) => <span key={i} style={{ '--h': `${7 + Math.abs(Math.sin(i * 1.4) * Math.cos(i * 0.41)) * 33}px`, '--d': `${(i % 11) * 0.08}s` }} className={recordState === 'recording' ? 'moving' : ''} />)}</div>
+          <div className="record-controls">{recordState === 'idle' ? <button onClick={startRecording} className="record-start"><Mic size={20} /> Start recording</button> : <>
+            <button className="secondary-button" disabled={recordState === 'stopping' || recordState === 'starting'} onClick={togglePause}>{recordState === 'paused' ? <Play size={18} /> : <Pause size={18} />} {recordState === 'paused' ? 'Resume' : 'Pause'}</button>
+            <button className="stop-button" disabled={recordState === 'stopping' || recordState === 'starting'} onClick={stopRecording}><Square size={16} fill="currentColor" /> Stop</button>
+          </>}</div>
+          <div className="live-status"><span className={recordState === 'recording' ? 'green-dot' : 'muted-dot'} />{running ? liveStatus : 'Start recording to enable live transcription'}</div>
+          {running && <div className="live-caption" aria-live="polite">
+            <span className="live-caption-label">LIVE CAPTIONS</span>
+            <p>{interim || (recordState === 'recording' ? 'Listening… Words will appear as the lecturer speaks and then move into the transcript.' : 'Recording paused or connecting...')}</p>
+          </div>}
+        </section>
 
-      <details className="chat-options">
-        <summary title="Lecture actions">
-          <Ellipsis size={18} />
-        </summary>
-
-        <div className="menu-pop">
-          <button
-            disabled={isRecording}
-            onClick={() =>
-              renameLecture(item._id, item.title)
-            }
-          >
-            <Pencil size={15} />
-            Rename
-          </button>
-
-          <button
-            disabled={isRecording}
-            onClick={() =>
-              togglePin(item._id, item.pinned)
-            }
-          >
-            <Pin size={15} />
-            {item.pinned ? "Unpin" : "Pin"}
-          </button>
-
-          <button
-            onClick={() => handlePdf(item._id)}
-          >
-            <FileDown size={15} />
-            Export PDF
-          </button>
-
-          <button
-            onClick={() =>
-              shareLecture(item._id, item.title)
-            }
-          >
-            <Share2 size={15} />
-            Share
-          </button>
-
-          <button
-            className="danger"
-            disabled={isRecording}
-            onClick={() =>
-              deleteLecture(item._id, item.title)
-            }
-          >
-            <Trash2 size={15} />
-            Delete
-          </button>
+        <div className="content-tabs"><div className="tabs">
+          <button className={tab === 'transcript' ? 'selected' : ''} onClick={() => setTab('transcript')}><AudioLines size={17} /> Transcript</button>
+          <button className={tab === 'notes' ? 'selected' : ''} onClick={() => setTab('notes')}><BookOpenText size={17} /> Organized notes</button>
         </div>
-      </details>
-    </div>
-  );
-
-  // ------------------------------
-  // Main layout
-  // ------------------------------
-
-  return (
-    <div className="app-shell">
-      {mobileNav && (
-        <button
-          className="sidebar-overlay"
-          aria-label="Close navigation"
-          onClick={() => setMobileNav(false)}
-        />
-      )}
-
-      {/* Sidebar */}
-
-      <aside
-        className={
-          "sidebar " +
-          (mobileNav ? "open" : "")
-        }
-      >
-        <div className="brand">
-          <span className="brand-icon">
-            <AudioLines size={21} />
-          </span>
-
-          <span>
-            LectureFlow <b>AI</b>
-          </span>
-
-          <button
-            className="icon-button mobile-close"
-            onClick={() => setMobileNav(false)}
-          >
-            <X size={19} />
-          </button>
+          {tab === 'notes' ? <div className="tab-actions"><button disabled={!lecture.transcript?.length || busy || running} className="small-action" onClick={organizeNotes}><Sparkles size={16} />{busy ? 'Generating...' : 'Generate AI notes'}</button></div>
+            : <span className="transcript-count">{lecture.transcript?.length || 0} segments</span>}
         </div>
-
-        <button
-          className="new-button"
-          onClick={createLecture}
-          disabled={isRecording}
-        >
-          <Plus size={19} />
-          New lecture
-        </button>
-
-        <div className="search-box">
-          <Search size={17} />
-
-          <input
-            value={query}
-            onChange={(event) =>
-              setQuery(event.target.value)
-            }
-            placeholder="Search your lectures..."
-          />
+        {tab === 'transcript' ? <div className="transcript-content">
+          {!lecture.transcript?.length && !interim && <div className="empty-content"><Mic size={30} /><h3>Waiting for your lecture</h3><p>Press Start recording. Confirmed sentences will appear here and save to MongoDB.</p></div>}
+          {lecture.transcript?.map((s, i) => <div className="segment" key={s.id || i}>
+            <span className="timestamp">{fmt(s.seconds)}</span>
+            <div className="segment-content"><p>{s.text}</p>
+              <label className="speaker-label">Speaker:
+                <select aria-label={`Speaker for transcript segment ${i + 1}`} value={s.speaker || 'unknown'}
+                  disabled={running} onChange={e => markSpeaker(s.id, e.target.value)}>
+                  <option value="unknown">Unidentified</option>
+                  <option value="lecturer">Lecturer</option>
+                  <option value="student">Student / question</option>
+                  <option value="offtopic">Off-topic · skip in notes</option>
+                </select>
+              </label>
+            </div>
+          </div>)}
+          {!!interim && <div className="segment interim"><span className="timestamp">LIVE</span><p>{interim}<span className="typing-cursor" /></p></div>}
+        </div> : <div className="note-content">
+          <div className="note-toolbar"><span>AI notes can be edited before sharing or exporting.</span>
+            <button className="small-action" onClick={() => { if (editing) setEditing(false); else { setDraft(lecture.notesMarkdown || ''); setEditing(true); } }}><Pencil size={15} />{editing ? 'Cancel editing' : 'Edit notes'}</button></div>
+          {editing ? <><textarea className="notes-editor" rows={16} value={draft} onChange={e => setDraft(e.target.value)} placeholder="# Lecture topic\n\nWrite your notes here..." />
+            <button className="primary-button" onClick={() => patch({ notesMarkdown: draft }).then(() => setEditing(false)).catch(alertError)}><Check size={17} /> Save notes</button></> :
+            <div className="markdown-body"><ReactMarkdown>{lecture.notesMarkdown || 'No organized notes yet. Record your lecture, then select **Generate AI notes**.'}</ReactMarkdown></div>}
+        </div>}
+        <div className="lecture-footer">
+          <button className="small-action" onClick={() => downloadLocalAudio(lecture._id, lecture.title).catch(alertError)} disabled={!audioCount || running}><Download size={16} /> Download local audio {audioCount ? `(${audioCount} chunks)` : ''}</button>
+          <button className="small-action danger-text" disabled={running} onClick={() => deleteLecture(lecture._id, lecture.title)}><Trash2 size={16} /> Delete lecture</button>
         </div>
-
-        <div className="chat-list">
-          {pinned.length > 0 && (
-            <>
-              <div className="group-label">
-                <Pin size={12} />
-                PINNED
-              </div>
-
-              {pinned.map(renderLectureItem)}
-            </>
-          )}
-
-          <div className="group-label">
-            RECENT LECTURES
-          </div>
-
-          {recent.length > 0 ? (
-            recent.map(renderLectureItem)
-          ) : (
-            <p className="empty-side">
-              No lectures found.
-            </p>
-          )}
-        </div>
-
-        <div className="sidebar-footer">
-          <span className="privacy-hint">
-            Your audio stays on this device.
-          </span>
-        </div>
-      </aside>
-
-      {/* Main area */}
-
-      <main className="main">
-        <header className="topbar">
-          <div className="topbar-left">
-            <button
-              className="icon-button mobile-menu"
-              onClick={() => setMobileNav(true)}
-            >
-              <Menu size={21} />
-            </button>
-
-            <span className="topbar-title">
-              {lecture?.title || "My Lectures"}
-            </span>
-          </div>
-          <div className="topbar-right">
-            <IconButton
-              title="Switch theme"
-              onClick={toggleTheme}
-            >
-              {theme === "dark" ? (
-                <Sun size={19} />
-              ) : (
-                <Moon size={19} />
-              )}
-            </IconButton>
-          </div>
-
-        </header>
-
-        {error && (
-          <div className="error-banner">
-            <span>{error}</span>
-
-            <IconButton
-              title="Dismiss error"
-              onClick={() => setError("")}
-            >
-              <X size={16} />
-            </IconButton>
-          </div>
-        )}
-
-        {/* Welcome screen */}
-
-        {!activeId ? (
-          <section className="welcome">
-            <div className="welcome-icon">
-              <Mic size={28} />
-            </div>
-
-            <h1>Never miss a lecture note.</h1>
-
-            <p>
-              Record your lectures, view speech
-              as live text, and generate
-              organized study notes using Gemini AI.
-            </p>
-
-            <button
-              className="primary-button"
-              onClick={createLecture}
-            >
-              <Plus size={19} />
-              Start a new lecture
-            </button>
-
-            <div className="welcome-features">
-              <span>
-                <Check size={16} />
-                Live transcription
-              </span>
-
-              <span>
-                <Check size={16} />
-                MongoDB notes
-              </span>
-
-              <span>
-                <Check size={16} />
-                Local audio
-              </span>
-            </div>
-          </section>
-        ) : !lecture ? (
-          <div className="loading-state">
-            Loading lecture...
-          </div>
-        ) : (
-          <section className="workspace">
-            {/* Lecture heading */}
-
-            <div className="lecture-heading">
-              <div>
-                <p className="eyebrow">
-                  LECTURE SESSION ·
-                  {" " + formatDate(lecture.createdAt)}
-                </p>
-
-                <h1>{lecture.title}</h1>
-
-                <p className="lecture-meta">
-                  {formatTime(seconds)} recorded
-                  {" · "}
-                  {lecture.transcript?.length || 0}
-                  {" "}confirmed segments
-                </p>
-              </div>
-
-              <div className="action-row">
-                <IconButton
-                  title="Rename"
-                  disabled={isRecording}
-                  onClick={() =>
-                    renameLecture(
-                      lecture._id,
-                      lecture.title
-                    )
-                  }
-                >
-                  <Pencil size={18} />
-                </IconButton>
-
-                <IconButton
-                  title="Pin or unpin"
-                  disabled={isRecording}
-                  onClick={() =>
-                    togglePin(
-                      lecture._id,
-                      lecture.pinned
-                    )
-                  }
-                >
-                  <Pin size={18} />
-                </IconButton>
-
-                <IconButton
-                  title="Share lecture"
-                  onClick={() =>
-                    shareLecture(
-                      lecture._id,
-                      lecture.title
-                    )
-                  }
-                >
-                  <Share2 size={18} />
-                </IconButton>
-
-                <IconButton
-                  title="Export PDF"
-                  onClick={() =>
-                    handlePdf(lecture._id)
-                  }
-                >
-                  <FileDown size={18} />
-                </IconButton>
-              </div>
-            </div>
-
-            {/* Recording panel */}
-
-            <section
-              className={
-                "record-card " +
-                (isRecording ? "is-recording" : "")
-              }
-            >
-              <div className="record-info">
-                <div className="record-indicator">
-                  <span
-                    className={
-                      recordState === "recording"
-                        ? "red-dot"
-                        : "muted-dot"
-                    }
-                  />
-
-                  {recordState === "recording"
-                    ? "Recording"
-                    : recordState === "paused"
-                      ? "Paused"
-                      : recordState === "starting"
-                        ? "Starting..."
-                        : recordState === "stopping"
-                          ? "Finishing..."
-                          : "Ready to record"}
-                </div>
-
-                <strong className="timer">
-                  {formatTime(seconds)}
-                </strong>
-              </div>
-
-              <div className="waveform">
-                {Array.from(
-                  { length: 48 },
-                  (_, index) => (
-                    <span
-                      key={index}
-                      className={
-                        recordState === "recording"
-                          ? "moving"
-                          : ""
-                      }
-                      style={{
-                        "--h":
-                          `${7 +
-                          Math.abs(
-                            Math.sin(index * 1.4)
-                          ) * 33
-                          }px`,
-                        "--d":
-                          `${(index % 11) * 0.08}s`,
-                      }}
-                    />
-                  )
-                )}
-              </div>
-
-              <div className="record-controls">
-                {recordState === "idle" ? (
-                  <button
-                    className="record-start"
-                    onClick={startRecording}
-                  >
-                    <Mic size={20} />
-                    Start recording
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      className="secondary-button"
-                      disabled={
-                        recordState === "starting" ||
-                        recordState === "stopping"
-                      }
-                      onClick={togglePause}
-                    >
-                      {recordState === "paused" ? (
-                        <Play size={18} />
-                      ) : (
-                        <Pause size={18} />
-                      )}
-
-                      {recordState === "paused"
-                        ? "Resume"
-                        : "Pause"}
-                    </button>
-
-                    <button
-                      className="stop-button"
-                      disabled={
-                        recordState === "starting" ||
-                        recordState === "stopping"
-                      }
-                      onClick={stopRecording}
-                    >
-                      <Square size={16} />
-                      Stop
-                    </button>
-                  </>
-                )}
-              </div>
-
-              <div className="live-status">
-                <span
-                  className={
-                    recordState === "recording"
-                      ? "green-dot"
-                      : "muted-dot"
-                  }
-                />
-
-                {isRecording
-                  ? liveStatus
-                  : "Start recording for live transcription"}
-              </div>
-            </section>
-
-            {/* Transcript / notes navigation */}
-
-            <div className="content-tabs">
-              <div className="tabs">
-                <button
-                  className={
-                    tab === "transcript"
-                      ? "selected"
-                      : ""
-                  }
-                  onClick={() =>
-                    setTab("transcript")
-                  }
-                >
-                  <AudioLines size={17} />
-                  Transcript
-                </button>
-
-                <button
-                  className={
-                    tab === "notes"
-                      ? "selected"
-                      : ""
-                  }
-                  onClick={() => setTab("notes")}
-                >
-                  <BookOpenText size={17} />
-                  Organized notes
-                </button>
-              </div>
-
-              {tab === "notes" ? (
-                <button
-                  className="small-action"
-                  onClick={organizeNotes}
-                  disabled={
-                    busy ||
-                    isRecording ||
-                    !lecture.transcript?.length
-                  }
-                >
-                  <Sparkles size={16} />
-                  {busy
-                    ? "Generating..."
-                    : "Generate AI notes"}
-                </button>
-              ) : (
-                <span className="transcript-count">
-                  {lecture.transcript?.length || 0}
-                  {" "}segments
-                </span>
-              )}
-            </div>
-
-            {/* Transcript screen */}
-
-            {tab === "transcript" ? (
-              <div className="transcript-content">
-                {!lecture.transcript?.length &&
-                  !interim && (
-                    <div className="empty-content">
-                      <Mic size={30} />
-
-                      <h3>
-                        Waiting for your lecture
-                      </h3>
-
-                      <p>
-                        Start recording to show live
-                        speech here.
-                      </p>
-                    </div>
-                  )}
-
-                {lecture.transcript?.map(
-                  (segment, index) => (
-                    <div
-                      className="segment"
-                      key={segment.id || index}
-                    >
-                      <span className="timestamp">
-                        {formatTime(
-                          segment.seconds
-                        )}
-                      </span>
-
-                      <p>{segment.text}</p>
-                    </div>
-                  )
-                )}
-
-                {interim && (
-                  <div className="segment interim">
-                    <span className="timestamp">
-                      LIVE
-                    </span>
-
-                    <p>
-                      {interim}
-                      <span className="typing-cursor" />
-                    </p>
-                  </div>
-                )}
-              </div>
-            ) : (
-              /* Organized notes screen */
-
-              <div className="note-content">
-                <div className="note-toolbar">
-                  <span>
-                    Edit your generated lecture notes.
-                  </span>
-
-                  <button
-                    className="small-action"
-                    onClick={() => {
-                      if (editing) {
-                        setEditing(false);
-                      } else {
-                        setDraft(
-                          lecture.notesMarkdown || ""
-                        );
-                        setEditing(true);
-                      }
-                    }}
-                  >
-                    <Pencil size={15} />
-                    {editing
-                      ? "Cancel editing"
-                      : "Edit notes"}
-                  </button>
-                </div>
-
-                {editing ? (
-                  <>
-                    <textarea
-                      className="notes-editor"
-                      rows={16}
-                      value={draft}
-                      onChange={(event) =>
-                        setDraft(event.target.value)
-                      }
-                      placeholder="# Lecture Topic"
-                    />
-
-                    <button
-                      className="primary-button"
-                      onClick={saveNotes}
-                    >
-                      <Check size={17} />
-                      Save notes
-                    </button>
-                  </>
-                ) : (
-                  <div className="markdown-body">
-                    <ReactMarkdown>
-                      {lecture.notesMarkdown ||
-                        "No organized notes yet. " +
-                        "Record your lecture and " +
-                        "click Generate AI notes."}
-                    </ReactMarkdown>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Footer actions */}
-
-            <div className="lecture-footer">
-              <button
-                className="small-action"
-                disabled={
-                  isRecording || !audioCount
-                }
-                onClick={() =>
-                  downloadLocalAudio(
-                    lecture._id,
-                    lecture.title
-                  ).catch(showError)
-                }
-              >
-                <Download size={16} />
-                Download local audio
-              </button>
-
-              <button
-                className="small-action"
-                disabled={isRecording}
-                onClick={revokeShare}
-              >
-                <X size={16} />
-                Revoke share link
-              </button>
-
-              <button
-                className="small-action danger-text"
-                disabled={isRecording}
-                onClick={() =>
-                  deleteLecture(
-                    lecture._id,
-                    lecture.title
-                  )
-                }
-              >
-                <Trash2 size={16} />
-                Delete lecture
-              </button>
-            </div>
-          </section>
-        )}
-      </main>
-    </div>
-  );
+      </section>}
+    </main>
+    {renameTarget && <RenameModal value={renameTarget} onCancel={() => setRenameTarget(null)} onSave={saveRename} />}
+  </div>;
 }

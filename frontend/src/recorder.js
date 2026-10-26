@@ -250,74 +250,72 @@ export class LectureRecorder {
         apiKey: token,
       });
 
-      const session = await sdk.live.connect({
+      const session = await ai.live.connect({
         model: "gemini-3.5-transcribe-live",
 
         config: {
           responseModalities: [Modality.TEXT],
+
           inputAudioTranscription: {
             languageCodes: [],
+
+            customVocabulary: [
+              "microprocessor",
+              "microcontroller",
+              "CPU",
+              "ALU",
+              "Control Unit",
+              "register file",
+              "program counter",
+              "instruction register",
+              "Von Neumann",
+              "Harvard architecture",
+              "RISC",
+              "CISC",
+              "address bus",
+              "data bus",
+              "control bus",
+              "UART",
+              "SPI",
+              "I2C",
+            ],
+
+            mode: "VERBATIM",
           },
         },
 
         callbacks: {
-          onopen: () => {},
+          onopen: () => { },
 
           onmessage: (message) => {
-            if (
-              this.stopping ||
-              this.version !== myVersion
-            ) {
-              return;
-            }
-
             const content = message.serverContent;
 
-            // Update tentative live words.
-
+            // Tentative words appear while speaking.
             if (
-              content?.interimInputTranscription?.text
+              typeof content?.interimInputTranscription?.text
+              === "string"
             ) {
-              this.callbacks.interim(
+              callbacks.interim(
                 content.interimInputTranscription.text
               );
             }
 
-            // Save confirmed transcription text.
+            // Completed speech is added to the transcript.
+            if (content?.inputTranscription?.text) {
+              callbacks.interim("");
 
-            if (
-              content?.inputTranscription?.text
-            ) {
-              this.callbacks.interim("");
-
-              this.callbacks.final(
+              callbacks.final(
                 content.inputTranscription.text
               );
             }
           },
 
-          onerror: () => {
-            this.callbacks.status(
-              "Transcription connection problem"
-            );
+          onerror: (error) => {
+            console.error("Gemini Live error:", error);
           },
 
           onclose: () => {
-            if (
-              !this.stopping &&
-              this.version === myVersion
-            ) {
-              this.live = null;
-
-              this.callbacks.status(
-                "Reconnecting transcription..."
-              );
-
-              this.retryTimer = setTimeout(
-                () => this.connectLive(),
-                3500
-              );
-            }
+            console.log("Gemini session closed");
           },
         },
       });
@@ -388,13 +386,31 @@ export class LectureRecorder {
   // ------------------------------
 
   async stop() {
-    // Stop sending new PCM samples while allowing
-    // the final transcript event to arrive.
-
-    this.paused = true;
+    this.finishing = true;
 
     clearInterval(this.rotationTimer);
     clearTimeout(this.retryTimer);
+
+    // Ask Gemini to finalize the current utterance.
+    try {
+      this.live?.sendRealtimeInput({
+        audioStreamEnd: true,
+      });
+    } catch { }
+
+    // Still accept final transcript callbacks here.
+    await new Promise((resolve) =>
+      setTimeout(resolve, 1800)
+    );
+
+    this.stopped = true;
+    ++this.version;
+
+    try {
+      this.live?.close();
+    } catch { }
+
+    this.live = null;
 
     if (
       this.media &&
@@ -415,46 +431,18 @@ export class LectureRecorder {
       ?.getTracks()
       .forEach((track) => track.stop());
 
-    this.worklet?.disconnect();
     this.source?.disconnect();
+    this.worklet?.disconnect();
+    this.silencer?.disconnect();
 
-    if (this.live) {
-      try {
-        this.live.sendRealtimeInput({
-          audioStreamEnd: true,
-        });
-      } catch {
-        // Ignore if connection already ended.
-      }
+    await this.context?.close().catch(() => { });
 
-      // Give Gemini a short opportunity
-      // to finalize its last utterance.
+    await Promise.allSettled([
+      ...this.savedWrites,
+      ...this.finalWrites,
+    ]);
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, 1500)
-      );
-
-      this.stopping = true;
-
-      try {
-        this.live.close();
-      } catch {
-        // Ignore closed session.
-      }
-    } else {
-      this.stopping = true;
-    }
-
-    this.version++;
-
-    try {
-      await this.context?.close();
-    } catch {
-      // Ignore audio context cleanup errors.
-    }
-
-    this.callbacks.status(
-      "Recording stopped"
-    );
+    this.callbacks.interim("");
+    this.callbacks.status("Recording stopped");
   }
 }

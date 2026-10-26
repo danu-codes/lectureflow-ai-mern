@@ -1,52 +1,44 @@
-# LectureFlow AI — Web MVP
+# LectureFlow AI — Live Transcription Improvements (v2)
 
-A responsive, dark/light lecture recorder with Gemini Live transcription, MongoDB lecture text storage, local-only audio (IndexedDB), AI note generation, PDF export and read-only sharing.
+This version includes a responsive React/Vite frontend and an Express/Mongoose backend. Microphone audio chunks are stored **only in IndexedDB on the recording device**; MongoDB stores transcript text and notes. The browser sends microphone PCM to Gemini during transcription, but the Express API never persists audio files.
 
-## Prerequisites
+## Changes
 
-- Node.js 20+
-- MongoDB Atlas database with database user and network access configured
-- Gemini API key (Google AI Studio). Check whether `gemini-3.5-transcribe-live` and `gemini-3.5-flash-lite` are available to your API project.
+- Visible interim live captions and finalized transcript segments.
+- Recorder saves audio locally even if Gemini becomes disconnected; queues up to roughly 10–16 seconds of PCM for reconnection, warns if longer gaps occur; rotates the 10-minute Gemini Live API connection every 8 minutes.
+- Waits for a finalized transcript event briefly after stopping.
+- Automatic language detection, VERBATIM transcription and a small technical vocabulary to support lecture terms. **Sinhala and Tamil are not on the model's published supported-languages list; live accuracy is not guaranteed.**
+- Manual labels for lecturer/student/off-topic/unknown; exclude off-topic from AI notes.
+- Rename modal replaces browser prompt.
+- Shared viewer suppresses a repeated Markdown title.
+- Removed the revoke sharing UI/route; creating a share link returns the same link on subsequent requests. Existing hash-only links from old versions will be replaced when you first create a link with the new version.
+- Removed sidebar theme control and header's MongoDB status label; theme button remains at upper right.
 
-## Setup
+## Install and run
 
-1. `cd server && npm install`
-2. Copy `server/.env.example` to `server/.env` and fill all values. For `ANON_COOKIE_SECRET`, generate a random secret with `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"`.
-3. In a first terminal: `cd server && npm run dev`
-4. In another terminal: `cd client && npm install && npm run dev`
-5. Open http://localhost:5173
+1. Install Node.js 22 or later and ensure MongoDB Atlas allows the connection.
+2. Copy `server/.env.example` to `server/.env` and fill in `MONGODB_URI`, `GEMINI_API_KEY`, `ANON_COOKIE_SECRET` (minimum 32 random characters), `PORT=5000`, and `NODE_ENV=development`.
+3. In one terminal: `cd server && npm install && npm run dev`.
+4. In another terminal: `cd client && npm install && npm run dev`.
+5. Open `http://localhost:5173` in desktop Chrome. Android recording requires an HTTPS host or secure HTTPS development tunnel.
 
-If the server fails to start, check the Atlas URI, Atlas database user, and IP network access list.
+## Test
 
-## What it does
+1. Create a lecture and record 1–2 minutes of clear speech; confirm `LIVE CAPTIONS` changes *while speaking*.
+2. Pause, finish a sentence and stop; check finalized words are preserved.
+3. Reload, find the transcript in MongoDB, and download local audio on the same device.
+4. Mark a segment Student or Off-topic, then Generate AI notes; off-topic text should be omitted.
+5. Rename via sidebar `...` and via lecture toolbar.
+6. Share, refresh read-only page, and verify lecture title appears once. Share again; same link is returned.
+7. Disconnect Wi-Fi while recording. Local audio recording should continue when the browser keeps the page alive, and the UI should warn if live transcripts might be missing.
 
-- Signed httpOnly anonymous browser cookie scopes access to private MongoDB lectures. No login UI.
-- MongoDB: chat titles, pinned status, transcripts, editable notes, duration, hashed share link.
-- Browser IndexedDB: audio chunks plus transcript segments queued for retry.
-- Gemini Live: receives microphone 16 kHz mono PCM, displays interim text and saves finalized text. Transcription sessions rotate before 10 minutes; interruptions may still lose a few spoken words, but locally recorded audio is preserved for later recovery.
-- Gemini Flash-Lite: organizes finalized transcript as Markdown headings/subheadings, suggests a title. It is *not* permitted to silently invent missing speech.
-- PDF export generates a downloadable PDF. Viewer share link is read-only and does not grant access to local audio.
+## Limitations and safety
 
-## Mobile Chrome testing
-
-Browser microphone access requires a **secure context**. `localhost` on a laptop works for laptop microphone tests. Opening `http://YOUR-LAPTOP-IP:5173` on your phone over Wi-Fi typically **does not** grant microphone access. Deploy to HTTPS first or use a secure dev tunnel. Keep the mobile recording tab in foreground and the screen awake. Test short recordings before real lectures.
-
-## Free deployment idea
-
-The Express backend also serves `client/dist` when `NODE_ENV=production`, so both can be hosted on one free Render Web Service, avoiding cross-origin anonymous cookie issues. From the repository root:
-
-- Build command: `npm install --prefix server && npm install --prefix client && npm run build --prefix client`
-- Start command: `npm start --prefix server`
-- Environment: `NODE_ENV=production`, `MONGODB_URI`, `GEMINI_API_KEY`, `ANON_COOKIE_SECRET`.
-
-Free Render instances can spin down on idle and have resource limitations. MongoDB Atlas free plan storage and Gemini quotas also apply. Do not rely on free infrastructure for important recordings without keeping local backups.
-
-## Security and limitations
-
-- Owner identity is a signed httpOnly cookie, **not an account**. If browser cookies are lost, private lectures cannot be recovered automatically. A proper recovery/export mechanism is needed before real use.
-- Anyone with a share link can read it; generating a new link revokes the old one. The revoke button disables the current link.
-- The API has basic rate limits only. For a publicly accessible app, add an application-wide abuse protection layer (e.g. Cloudflare Turnstile/rate limits) to guard Gemini quota use.
-- Local IndexedDB chunks may be evicted by browser cleanup/storage pressure. Audio data is never uploaded to Express or MongoDB; Gemini receives audio for processing only.
-- Reconnect/rotation can create gaps in transcription; locally stored audio helps recovery, but audio re-transcription from saved chunks is not yet implemented.
-- PDF currently uses jsPDF built-in fonts, optimized for English lecture notes. Tamil/Sinhala rendering requires embedded Unicode fonts (not bundled).
-- Live Gemini API requires a valid API key and project access; this repository has not been tested against a user's real API key.
+- This patch has been syntax-checked, but couldn't be fully built or run against MongoDB/Gemini in this sandbox because npm registry DNS was inaccessible. Test with your own accounts before relying on it during a lecture.
+- A browser cannot guarantee microphone recording while locked or backgrounded on Android. Keep the tab foregrounded and screen awake.
+- The live API cannot perform automatic speaker diarization. Speaker role dropdowns are manual.
+- This version does **not yet** contain a complete local-audio batch retranscription tool. In the future, use a consented, temporary processing endpoint to repair gaps; never store those recordings in MongoDB.
+- Gemini 3.5 Transcribe Live supports a 10-minute session; reconnection or rotation can still create gaps. Local recordings provide an independent source for recovery.
+- Shared links are unguessable but anyone possessing a link can read its notes. Without a revoke feature, the way to invalidate a link is to delete the lecture or add link rotation later.
+- The app uses an anonymous signed cookie as a device identity. Clearing browser data may make private MongoDB notes inaccessible. Implement recovery before long-term use.
+- Get permission from lecturers/participants to record and transmit classroom speech to a transcription service.
