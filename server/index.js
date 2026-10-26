@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
 import mongoose from 'mongoose';
 import cookieParser from 'cookie-parser';
@@ -8,10 +8,13 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Load the .env located beside this file, irrespective of terminal directory.
+dotenv.config({ path: fileURLToPath(new URL('./.env', import.meta.url)) });
+
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '60kb' }));
+app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser(process.env.ANON_COOKIE_SECRET));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false }));
 
@@ -55,7 +58,11 @@ app.use('/api', (req, res, next) => {
     req.ownerId = owner;
     next();
 });
-app.get('/api/health', (_, res) => res.json({ ok: true }));
+app.get('/api/health', (_, res) => res.json({
+    ok: true,
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    databaseName: mongoose.connection.readyState === 1 ? mongoose.connection.name : null
+}));
 
 // Every private query is scoped to the signed anonymous owner cookie.
 app.get('/api/lectures', asyncRoute(async (req, res) => {
@@ -91,7 +98,7 @@ app.patch('/api/lectures/:id', asyncRoute(async (req, res) => {
     }
     const doc = await Lecture.findOneAndUpdate(
         { _id: req.params.id, ownerId: req.ownerId },
-        { $set: update }, { new: true, runValidators: true }
+        { $set: update }, { returnDocument: 'after', runValidators: true }
     );
     if (!doc) return sendError(res, 404, 'Lecture not found');
     res.json(doc);
@@ -106,7 +113,7 @@ app.delete('/api/lectures/:id', asyncRoute(async (req, res) => {
 app.post('/api/lectures/:id/segments', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
     const { id, text, seconds } = req.body;
-    if (typeof id !== 'string' || id.length > 80 || typeof text !== 'string' || !text.trim() || text.length > 2000) {
+    if (typeof id !== 'string' || !id.trim() || id.length > 80 || typeof text !== 'string' || !text.trim() || text.length > 2000) {
         return sendError(res, 400, 'Invalid transcript segment');
     }
     const segment = { id, text: text.trim(), seconds: Number.isFinite(seconds) ? Math.max(0, seconds) : 0 };
@@ -257,8 +264,15 @@ app.get('/api/public/:token', asyncRoute(async (req, res) => {
 const staticPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../client/dist');
 if (process.env.NODE_ENV === 'production') {
     app.use(express.static(staticPath));
-    app.get(/^(?!\/api\/).*/, (_, res) => res.sendFile(path.join(staticPath, 'index.html')));
+    app.use((req, res, next) => {
+        if (req.method !== 'GET' || req.path.startsWith('/api/')) return next();
+        res.sendFile(path.join(staticPath, 'index.html'));
+    });
 }
+
+// Unknown API requests must return JSON, not the React HTML page.
+app.use('/api', (_req, res) => sendError(res, 404, 'API endpoint not found'));
+
 app.use((error, req, res, next) => {
     console.error(error.message);
     if (res.headersSent) return next(error);
@@ -266,9 +280,31 @@ app.use((error, req, res, next) => {
 });
 
 const port = Number(process.env.PORT || 5000);
-if (!process.env.MONGODB_URI || !process.env.ANON_COOKIE_SECRET || process.env.ANON_COOKIE_SECRET.length < 32) {
-    console.error('Set MONGODB_URI and ANON_COOKIE_SECRET (32+ characters) in server/.env');
-    process.exit(1);
+// Accept MONGO_URI temporarily for compatibility with your older server.js.
+const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+
+async function startServer() {
+    if (!mongoUri) {
+        console.error('Missing MONGODB_URI in server/.env (MONGO_URI is also accepted).');
+        process.exitCode = 1;
+        return;
+    }
+    if (!process.env.ANON_COOKIE_SECRET || process.env.ANON_COOKIE_SECRET.length < 32) {
+        console.error('Set ANON_COOKIE_SECRET to at least 32 characters in server/.env.');
+        process.exitCode = 1;
+        return;
+    }
+    try {
+        console.log('Connecting to MongoDB Atlas...');
+        await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 15000 });
+        console.log(`MongoDB connected successfully! Database: ${mongoose.connection.name}`);
+        app.listen(port, '0.0.0.0', () => {
+            console.log(`LectureFlow API running on http://localhost:${port}`);
+        });
+    } catch (error) {
+        console.error('MongoDB startup failed:', error.message);
+        process.exitCode = 1;
+    }
 }
-await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
-app.listen(port, '0.0.0.0', () => console.log(`LectureFlow API running on http://localhost:${port}`));
+
+startServer();
