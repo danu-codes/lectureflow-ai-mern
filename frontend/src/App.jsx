@@ -101,10 +101,10 @@ function PublicLecture() {
 
   const content = lecture
     ? lecture.notesMarkdown ||
-      lecture.transcript
-        ?.map((segment) => segment.text)
-        .join("\n\n") ||
-      "No notes available."
+    lecture.transcript
+      ?.map((segment) => segment.text)
+      .join("\n\n") ||
+    "No notes available."
     : "";
 
   return (
@@ -1026,27 +1026,6 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div className="theme-select">
-            <span>
-              {theme === "dark" ? (
-                <Moon size={16} />
-              ) : (
-                <Sun size={16} />
-              )}
-
-              {theme === "dark"
-                ? "Dark theme"
-                : "Light theme"}
-            </span>
-
-            <IconButton
-              title="Switch theme"
-              onClick={toggleTheme}
-            >
-              <RotateCw size={16} />
-            </IconButton>
-          </div>
-
           <span className="privacy-hint">
             Your audio stays on this device.
           </span>
@@ -1069,24 +1048,19 @@ export default function App() {
               {lecture?.title || "My Lectures"}
             </span>
           </div>
-
           <div className="topbar-right">
-            <span className="top-label">
-              <Cloud size={15} />
-              MongoDB Notes
-            </span>
-
             <IconButton
               title="Switch theme"
               onClick={toggleTheme}
             >
               {theme === "dark" ? (
-                <Sun size={18} />
+                <Sun size={19} />
               ) : (
-                <Moon size={18} />
+                <Moon size={19} />
               )}
             </IconButton>
           </div>
+
         </header>
 
         {error && (
@@ -1265,11 +1239,10 @@ export default function App() {
                       }
                       style={{
                         "--h":
-                          `${
-                            7 +
-                            Math.abs(
-                              Math.sin(index * 1.4)
-                            ) * 33
+                          `${7 +
+                          Math.abs(
+                            Math.sin(index * 1.4)
+                          ) * 33
                           }px`,
                         "--d":
                           `${(index % 11) * 0.08}s`,
