@@ -4,12 +4,13 @@ import {
   AudioLines, BookOpenText, Check, CircleHelp,
   Download, Ellipsis, FileDown, FileText, Menu, Mic,
   Moon, Pause, Pin, Play, Plus, Search, Share2, Sparkles,
-  Square, Sun, Trash2, X, Pencil
+  Square, Sun, Trash2, X, Pencil, LogOut, UserRound
 } from 'lucide-react';
 import { api } from './api';
 import { db, downloadLocalAudio } from './db';
 import { LectureRecorder } from './recorder';
 import RenameModal from './RenameModal';
+import AuthPage from './AuthPage';
 import DeleteModal from './DeleteModal';
 
 const fmt = (seconds = 0) => `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
@@ -47,7 +48,7 @@ function PublicLecture() {
   </div>;
 }
 
-export default function App() {
+function LectureDashboard({ user, onLogout }) {
   const [theme, setTheme] = useState(() => localStorage.getItem('lf_theme') || 'dark');
   const [mobileNav, setMobileNav] = useState(false);
   const [list, setList] = useState([]);
@@ -73,7 +74,7 @@ export default function App() {
   const secondsRef = useRef(0);
   const flushPromiseRef = useRef(null);
   const recordingRef = useRef('idle');
-  const publicView = location.pathname.startsWith('/share/');
+  const publicView = false; // handled by App auth wrapper
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -126,8 +127,9 @@ export default function App() {
           await api(`/lectures/${item.lectureId}/segments`, { method: 'POST', body: item.segment });
           await db.pendingSegments.delete(item.id);
         } catch {
-          // Preserve the local queue; retry on the next interval or online event.
-          break;
+          // A stale locally queued segment can belong to a pre-migration lecture.
+          // Preserve it, but don't block syncing segments from other lectures.
+          continue;
         }
       }
     };
@@ -360,7 +362,10 @@ export default function App() {
         <div className="group-label">RECENT LECTURES</div>
         {listOther.length ? listOther.map(sidebarItem) : <p className="empty-side">No lectures found.</p>}
       </div>
-      <div className="sidebar-footer"><span className="privacy-hint">Your audio stays on this device.</span></div>
+      <div className="sidebar-footer">
+        <div className="account-card"><span className="account-avatar"><UserRound size={17} /></span><span className="account-details"><strong>{user.name}</strong><small title={user.email}>{user.email}</small></span><IconButton title="Sign out" disabled={recordState !== 'idle' || busy} onClick={onLogout}><LogOut size={18} /></IconButton></div>
+        <span className="privacy-hint">Your audio stays on this device.</span>
+      </div>
     </aside>
 
     <main className="main">
@@ -443,4 +448,36 @@ export default function App() {
     {renameTarget && <RenameModal value={renameTarget} onCancel={() => setRenameTarget(null)} onSave={saveRename} />}
     {deleteTarget && <DeleteModal value={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={deleteLecture} />}
   </div>;
+}
+
+
+// Public shared links require no login. All other LectureFlow pages do.
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [checking, setChecking] = useState(true);
+  const publicPage = location.pathname.startsWith('/share/');
+
+  useEffect(() => {
+    if (publicPage) { setChecking(false); return; }
+    let mounted = true;
+    api('/auth/me')
+      .then(({ user }) => { if (mounted) setUser(user); })
+      .catch(() => { if (mounted) setUser(null); })
+      .finally(() => { if (mounted) setChecking(false); });
+    return () => { mounted = false; };
+  }, [publicPage]);
+
+  async function logout() {
+    try {
+      await api('/auth/logout', { method: 'POST' });
+      setUser(null);
+    } catch (error) {
+      window.alert(error.message || 'Could not sign out.');
+    }
+  }
+
+  if (publicPage) return <PublicLecture />;
+  if (checking) return <div className="auth-loading"><AudioLines size={25} /> Checking your session...</div>;
+  if (!user) return <AuthPage onAuth={setUser} />;
+  return <LectureDashboard key={user.id} user={user} onLogout={logout} />;
 }

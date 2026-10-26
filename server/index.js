@@ -1,10 +1,12 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import mongoose from 'mongoose';
-import cookieParser from 'cookie-parser';
+import session from 'express-session';
+import MongoStore from 'connect-mongo';
+import argon2 from 'argon2';
 import { rateLimit } from 'express-rate-limit';
 import { GoogleGenAI } from '@google/genai';
-import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,11 +18,45 @@ app.disable('x-powered-by');
 // Trust one reverse proxy only when deployed behind it (for example, Render).
 if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(express.json({ limit: '200kb' }));
-// Optional previous secret allows re-signing existing anonymous-owner cookies
-// after rotation. Remove ANON_COOKIE_SECRET_PREVIOUS after the migration period.
-const cookieSecrets = [process.env.ANON_COOKIE_SECRET, process.env.ANON_COOKIE_SECRET_PREVIOUS].filter(Boolean);
-app.use(cookieParser(cookieSecrets));
+// New login sessions are stored in MongoDB, not in process memory.
+const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+const sessionSecret = process.env.SESSION_SECRET;
+if (!mongoUri || !sessionSecret || sessionSecret.length < 32) {
+    console.error('Set MONGODB_URI and SESSION_SECRET (32+ characters) in server/.env');
+    process.exit(1);
+}
+app.use(session({
+    name: 'lectureflow.sid',
+    secret: sessionSecret,
+    store: MongoStore.create({ mongoUrl: mongoUri, collectionName: 'sessions', ttl: 7 * 24 * 60 * 60 }),
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    cookie: {
+        httpOnly: true, sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+        path: '/'
+    }
+}));
+// JSON mutation requests are allowed only from the configured app origin.
+app.use('/api', (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    const origin = req.get('origin');
+    const hostOrigin = `${req.protocol}://${req.get('host')}`;
+    const allowed = new Set([hostOrigin, process.env.APP_ORIGIN].filter(Boolean));
+    if (origin && !allowed.has(origin)) return res.status(403).json({ error: 'Invalid request origin' });
+    if (req.get('sec-fetch-site') === 'cross-site') return res.status(403).json({ error: 'Cross-site request blocked' });
+    next();
+});
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false }));
+
+const userSchema = new mongoose.Schema({
+    name: { type: String, required: true, trim: true, maxlength: 80 },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 254 },
+    passwordHash: { type: String, required: true, select: false }
+}, { timestamps: true });
+const User = mongoose.model('User', userSchema);
 
 const transcriptSchema = new mongoose.Schema({
     id: { type: String, required: true },
@@ -28,7 +64,8 @@ const transcriptSchema = new mongoose.Schema({
     seconds: { type: Number, default: 0 }
 }, { _id: false });
 const lectureSchema = new mongoose.Schema({
-    ownerId: { type: String, required: true, index: true },
+    ownerId: { type: String, index: true }, // legacy only; migration uses this
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
     title: { type: String, default: 'New Lecture', maxlength: 120 },
     pinned: { type: Boolean, default: false },
     transcript: { type: [transcriptSchema], default: [] },
@@ -39,7 +76,7 @@ const lectureSchema = new mongoose.Schema({
     shareHash: { type: String, default: null, index: true },
     shareToken: { type: String, default: null }
 }, { timestamps: true });
-lectureSchema.index({ ownerId: 1, updatedAt: -1 });
+lectureSchema.index({ userId: 1, updatedAt: -1 });
 const Lecture = mongoose.model('Lecture', lectureSchema);
 const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
 
@@ -48,37 +85,89 @@ function escapeRegex(str) { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function asyncRoute(fn) { return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next); }
 function sendError(res, code, message) { return res.status(code).json({ error: message }); }
 
-app.use('/api', (req, res, next) => {
-    // Public shared pages do not need to create an anonymous owner cookie.
-    if (req.path === '/health' || req.path.startsWith('/public/')) return next();
-
-    let owner = req.signedCookies?.lf_owner;
-    const isValid = typeof owner === 'string' && /^[0-9a-f-]{36}$/i.test(owner);
-    if (!isValid) owner = randomUUID();
-
-    // When rotating keys, accept a previous signed cookie temporarily, but
-    // re-sign the same owner ID using the new current key on this response.
-    if (!isValid || process.env.ANON_COOKIE_SECRET_PREVIOUS) {
-        res.cookie('lf_owner', owner, {
-            signed: true, httpOnly: true, sameSite: 'lax',
-            secure: process.env.NODE_ENV === 'production',
-            maxAge: 365 * 24 * 60 * 60 * 1000,
-            path: '/'
-        });
-    }
-    req.ownerId = owner;
-    next();
+// Authentication routes. Cookies contain only a random session ID.
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: 'draft-8',
+    legacyHeaders: false, message: { error: 'Too many attempts. Try again later.' }
 });
+const publicUser = user => ({ id: String(user._id), name: user.name, email: user.email });
+const emailOk = value => typeof value === 'string' && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+const saveSession = req => new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+const regenerateSession = req => new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
+const destroySession = req => new Promise((resolve, reject) => req.session.destroy(err => err ? reject(err) : resolve()));
+
+app.post('/api/auth/register', authLimiter, asyncRoute(async (req, res) => {
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password;
+    if (name.length < 2 || name.length > 80) return sendError(res, 400, 'Name must have 2–80 characters');
+    if (!emailOk(email)) return sendError(res, 400, 'Enter a valid email address');
+    if (typeof password !== 'string' || password.length < 10 || password.length > 128)
+        return sendError(res, 400, 'Password must be 10–128 characters');
+    if (await User.exists({ email })) return sendError(res, 409, 'This email is already registered');
+    const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
+    let user;
+    try { user = await User.create({ name, email, passwordHash }); }
+    catch (error) {
+        if (error.code === 11000) return sendError(res, 409, 'This email is already registered');
+        throw error;
+    }
+    await regenerateSession(req);
+    req.session.userId = String(user._id);
+    await saveSession(req);
+    res.status(201).json({ user: publicUser(user) });
+}));
+
+app.post('/api/auth/login', authLimiter, asyncRoute(async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password;
+    if (!emailOk(email) || typeof password !== 'string') return sendError(res, 401, 'Incorrect email or password');
+    const user = await User.findOne({ email }).select('+passwordHash');
+    if (!user || !(await argon2.verify(user.passwordHash, password)))
+        return sendError(res, 401, 'Incorrect email or password');
+    await regenerateSession(req); // defeats session fixation
+    req.session.userId = String(user._id);
+    await saveSession(req);
+    res.json({ user: publicUser(user) });
+}));
+
+app.post('/api/auth/logout', asyncRoute(async (req, res) => {
+    await destroySession(req);
+    res.clearCookie('lectureflow.sid', { path: '/', sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+    res.json({ ok: true });
+}));
+
+app.get('/api/auth/me', asyncRoute(async (req, res) => {
+    if (!req.session?.userId || !mongoose.isValidObjectId(req.session.userId)) return sendError(res, 401, 'Please log in');
+    const user = await User.findById(req.session.userId).lean();
+    if (!user) return sendError(res, 401, 'Please log in');
+    res.set('Cache-Control', 'no-store');
+    res.json({ user: publicUser(user) });
+}));
+
+async function requireAuth(req, res, next) {
+    try {
+        if (!req.session?.userId || !mongoose.isValidObjectId(req.session.userId)) return sendError(res, 401, 'Please log in');
+        const exists = await User.exists({ _id: req.session.userId });
+        if (!exists) return sendError(res, 401, 'Please log in');
+        req.userId = new mongoose.Types.ObjectId(req.session.userId);
+        next();
+    } catch (error) { next(error); }
+}
+// Every lecture and AI route below requires an authenticated account.
+app.use('/api/lectures', requireAuth);
+app.use('/api/ai', requireAuth);
+
 app.get('/api/health', (_, res) => res.json({
     ok: true,
     database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
     databaseName: mongoose.connection.readyState === 1 ? mongoose.connection.name : null
 }));
 
-// Every private query is scoped to the signed anonymous owner cookie.
+// Every private lecture query is scoped to the logged-in MongoDB user.
 app.get('/api/lectures', asyncRoute(async (req, res) => {
     const q = String(req.query.q || '').trim().slice(0, 80);
-    const filter = { ownerId: req.ownerId };
+    const filter = { userId: req.userId };
     if (q) {
         const rx = new RegExp(escapeRegex(q), 'i');
         filter.$or = [{ title: rx }, { notesMarkdown: rx }, { 'transcript.text': rx }];
@@ -89,12 +178,12 @@ app.get('/api/lectures', asyncRoute(async (req, res) => {
     res.json(list);
 }));
 app.post('/api/lectures', asyncRoute(async (req, res) => {
-    const doc = await Lecture.create({ ownerId: req.ownerId });
+    const doc = await Lecture.create({ userId: req.userId });
     res.status(201).json(doc);
 }));
 app.get('/api/lectures/:id', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
-    const doc = await Lecture.findOne({ _id: req.params.id, ownerId: req.ownerId }).lean();
+    const doc = await Lecture.findOne({ _id: req.params.id, userId: req.userId }).lean();
     if (!doc) return sendError(res, 404, 'Lecture not found');
     res.json(doc);
 }));
@@ -110,7 +199,7 @@ app.patch('/api/lectures/:id', asyncRoute(async (req, res) => {
     }
     if (!Object.keys(update).length) return sendError(res, 400, 'No valid lecture fields supplied');
     const doc = await Lecture.findOneAndUpdate(
-        { _id: req.params.id, ownerId: req.ownerId },
+        { _id: req.params.id, userId: req.userId },
         { $set: update }, { returnDocument: 'after', runValidators: true }
     );
     if (!doc) return sendError(res, 404, 'Lecture not found');
@@ -118,7 +207,7 @@ app.patch('/api/lectures/:id', asyncRoute(async (req, res) => {
 }));
 app.delete('/api/lectures/:id', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
-    const doc = await Lecture.findOneAndDelete({ _id: req.params.id, ownerId: req.ownerId });
+    const doc = await Lecture.findOneAndDelete({ _id: req.params.id, userId: req.userId });
     if (!doc) return sendError(res, 404, 'Lecture not found');
     res.json({ ok: true });
 }));
@@ -132,11 +221,11 @@ app.post('/api/lectures/:id/segments', asyncRoute(async (req, res) => {
     const segment = { id, text: text.trim(), seconds: Number.isFinite(seconds) ? Math.max(0, seconds) : 0 };
     // The idempotent update prevents duplicated text if a pending segment is retried.
     const result = await Lecture.updateOne(
-        { _id: req.params.id, ownerId: req.ownerId, 'transcript.id': { $ne: id } },
+        { _id: req.params.id, userId: req.userId, 'transcript.id': { $ne: id } },
         { $push: { transcript: segment }, $currentDate: { updatedAt: true } }
     );
     if (!result.matchedCount) {
-        const exists = await Lecture.exists({ _id: req.params.id, ownerId: req.ownerId });
+        const exists = await Lecture.exists({ _id: req.params.id, userId: req.userId });
         if (!exists) return sendError(res, 404, 'Lecture not found');
     }
     res.json({ ok: true });
@@ -254,7 +343,7 @@ async function aiNotes(contents) {
 app.post('/api/lectures/:id/organize', aiLimiter, asyncRoute(async (req, res) => {
     if (!ai) return sendError(res, 503, 'Set GEMINI_API_KEY in server/.env');
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
-    const doc = await Lecture.findOne({ _id: req.params.id, ownerId: req.ownerId });
+    const doc = await Lecture.findOne({ _id: req.params.id, userId: req.userId });
     if (!doc) return sendError(res, 404, 'Lecture not found');
     if (!doc.transcript.length) return sendError(res, 400, 'There is no finalized transcript yet. Audio saved locally has NOT been retranscribed.');
     if (doc.notesStatus === 'processing' && doc.notesStartedAt && (Date.now() - doc.notesStartedAt.getTime()) < 5 * 60_000) {
@@ -291,7 +380,7 @@ substantive ideas, definitions, and examples. Ignore unrelated conversations.\n\
         res.json(doc);
     } catch (error) {
         await Lecture.updateOne(
-            { _id: doc._id, ownerId: req.ownerId },
+            { _id: doc._id, userId: req.userId },
             { $set: { notesStatus: 'failed', notesStartedAt: null } }
         ).catch(() => { });
         return aiFailure(res, error, 'notes-generation');
@@ -300,7 +389,7 @@ substantive ideas, definitions, and examples. Ignore unrelated conversations.\n\
 
 app.post('/api/lectures/:id/share', asyncRoute(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return sendError(res, 400, 'Invalid lecture ID');
-    const doc = await Lecture.findOne({ _id: req.params.id, ownerId: req.ownerId });
+    const doc = await Lecture.findOne({ _id: req.params.id, userId: req.userId });
     if (!doc) return sendError(res, 404, 'Lecture not found');
     // Reuse a permanent read-only link; no separate revoke button.
     // For older documents with hash-only links, the first new share creates a fresh link.
@@ -344,21 +433,9 @@ app.use((error, req, res, next) => {
 
 const port = Number(process.env.PORT || 5000);
 // Accept MONGO_URI temporarily for compatibility with your older server.js.
-const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
-
 async function startServer() {
     if (!mongoUri) {
         console.error('Missing MONGODB_URI in server/.env (MONGO_URI is also accepted).');
-        process.exitCode = 1;
-        return;
-    }
-    if (!process.env.ANON_COOKIE_SECRET || process.env.ANON_COOKIE_SECRET.length < 32) {
-        console.error('Set ANON_COOKIE_SECRET to at least 32 characters in server/.env.');
-        process.exitCode = 1;
-        return;
-    }
-    if (process.env.ANON_COOKIE_SECRET_PREVIOUS && process.env.ANON_COOKIE_SECRET_PREVIOUS === process.env.ANON_COOKIE_SECRET) {
-        console.error('The previous cookie secret must differ from the current secret.');
         process.exitCode = 1;
         return;
     }
